@@ -1,0 +1,104 @@
+# Lima VM template for ZASK development
+#
+# Provides a Linux VM with kernel ≥ 5.8, LSM BPF enabled, and all
+# toolchain dependencies for eBPF development on macOS.
+#
+# Usage:
+#   limactl start lima/zask.yaml
+#   limactl shell zask
+#
+# See docs/lima-dev-guide.md for full setup instructions.
+
+# Use Rocky Linux 10.1 for an Enterprise Linux environment compatible with SELinux
+images:
+  - location: "https://dl.rockylinux.org/pub/rocky/10.1/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2"
+    arch: "x86_64"
+  - location: "https://dl.rockylinux.org/pub/rocky/10.1/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2"
+    arch: "aarch64"
+
+cpus: 2
+memory: "2GiB"
+disk: "10GiB"
+
+# Mount the project directory
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+
+# Provision the VM with all required dependencies
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # Update and install toolchain
+      dnf update -y
+      dnf install -y --enablerepo=crb \
+        gcc \
+        make \
+        clang \
+        llvm \
+        libbpf-devel \
+        kernel-devel-$(uname -r) \
+        kernel-headers-$(uname -r) \
+        bpftool \
+        git \
+        curl \
+        wget \
+        jq \
+        tar \
+        grubby
+
+      # Install Go (latest stable)
+      GO_VERSION="1.24.1"
+      if ! command -v go &> /dev/null; then
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; elif [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi
+        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
+        echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> /etc/profile.d/go.sh
+      fi
+
+      # Install golangci-lint
+      if ! command -v golangci-lint &> /dev/null; then
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b /usr/local/bin
+      fi
+
+      # Install govulncheck
+      /usr/local/go/bin/go install golang.org/x/vuln/cmd/govulncheck@latest
+      cp ~/go/bin/govulncheck /usr/local/bin/ 2>/dev/null || true
+
+      # Generate vmlinux.h for CO-RE
+      if [[ -f /sys/kernel/btf/vmlinux ]]; then
+        bpftool btf dump file /sys/kernel/btf/vmlinux format c > /usr/include/vmlinux.h
+        echo "vmlinux.h generated successfully"
+      else
+        echo "WARNING: /sys/kernel/btf/vmlinux not found. BTF may not be enabled."
+      fi
+
+      # Ensure BPF filesystem is mounted
+      if ! mount | grep -q "type bpf"; then
+        mount -t bpf bpf /sys/fs/bpf
+      fi
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # Rocky Linux uses grubby for kernel boot parameters alongside SELinux
+      if ! grubby --info=ALL | grep -q "bpf"; then
+        # Ensure selinux is preserved in the LSM list
+        grubby --update-kernel=ALL --args="lsm=lockdown,capability,landlock,yama,selinux,bpf"
+        echo "NOTE: BPF LSM boot parameter added. A VM restart is required."
+        echo "Run: limactl stop zask && limactl start zask"
+      fi
+
+probes:
+  - script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      test -x /usr/local/go/bin/go
+    hint: "Waiting for Go installation to complete..."
