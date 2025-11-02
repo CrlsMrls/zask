@@ -67,7 +67,7 @@ See [docs/lima-dev-guide.md](docs/lima-dev-guide.md) for detailed setup.
 
 ### Linux Development
 
-> **Note:** The maintainer primarily use macOS with Lima for development. The following native Linux workflow is provided for reference but has **not been tested**, comments are welcome.
+> **Note:** The maintainer primarily uses macOS with Lima for development. The following native Linux workflow is provided for reference but has **not been tested**, comments are welcome.
 
 ZASK interacts directly with the Linux kernel via eBPF LSM hooks. A bug or misconfiguration could cause kernel panics or system instability. **Never run or test the ZASK daemon on your primary workstation.** Always use a dedicated VM or an isolated test machine.
 
