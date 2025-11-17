@@ -1,0 +1,42 @@
+# ZASK Default Rules
+#
+# Static detection rules for Tier 2 (deterministic engine).
+# These rules are evaluated before AI analysis (Tier 3).
+#
+# Rule format:
+#   - name: Human-readable rule name
+#     description: What this rule detects
+#     pattern: Regex pattern matched against the full command line (argv)
+#     action: BLOCK | ALERT
+#     severity: critical | high | medium | low
+
+rules:
+  - name: reverse-shell-netcat
+    description: "Detects netcat-based reverse shells"
+    pattern: 'nc\s+.*-e\s+/bin/(sh|bash)'
+    action: BLOCK
+    severity: critical
+
+  - name: reverse-shell-bash-tcp
+    description: "Detects bash /dev/tcp reverse shells"
+    pattern: '/dev/tcp/\d+\.\d+\.\d+\.\d+/\d+'
+    action: BLOCK
+    severity: critical
+
+  - name: reverse-shell-python
+    description: "Detects Python-based reverse shells using socket+pty"
+    pattern: 'python[23]?\s+.*import\s+(socket|pty|subprocess).*connect'
+    action: BLOCK
+    severity: critical
+
+  - name: base64-decode-exec
+    description: "Detects base64-decoded command execution"
+    pattern: 'base64\s+(-d|--decode)\s*\|.*sh'
+    action: ALERT
+    severity: high
+
+  - name: curl-pipe-shell
+    description: "Detects curl/wget piped to shell"
+    pattern: '(curl|wget)\s+.*\|\s*(ba)?sh'
+    action: ALERT
+    severity: high
