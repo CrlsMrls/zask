@@ -68,3 +68,86 @@ func TestResolvePathToInode_MissingFile(t *testing.T) {
 		t.Fatal("ResolvePathToInode() expected error for missing file, got nil")
 	}
 }
+
+func TestFindScriptPath_PidZero(t *testing.T) {
+	result := FindScriptPath(0)
+	if result != "" {
+		t.Errorf("FindScriptPath(0) = %q, want empty", result)
+	}
+}
+
+func TestFindScriptPath_NonExistentPid(t *testing.T) {
+	// PID that almost certainly doesn't exist.
+	result := FindScriptPath(4294967)
+	if result != "" {
+		t.Errorf("FindScriptPath(nonexistent) = %q, want empty", result)
+	}
+}
+
+func TestFindScriptInArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+		args [][]byte
+	}{
+		{
+			name: "absolute path as first arg",
+			args: [][]byte{[]byte("/tmp/evil.py")},
+			want: "/tmp/evil.py",
+		},
+		{
+			name: "flags then absolute path",
+			args: [][]byte{[]byte("-u"), []byte("/tmp/evil.py")},
+			want: "/tmp/evil.py",
+		},
+		{
+			name: "multiple flags then path",
+			args: [][]byte{[]byte("-B"), []byte("-u"), []byte("/opt/app/main.py")},
+			want: "/opt/app/main.py",
+		},
+		{
+			name: "relative path with dot-slash",
+			args: [][]byte{[]byte("./app.js")},
+			want: "./app.js",
+		},
+		{
+			name: "relative path with double-dot",
+			args: [][]byte{[]byte("../scripts/run.sh")},
+			want: "../scripts/run.sh",
+		},
+		{
+			name: "bare filename (no path prefix)",
+			args: [][]byte{[]byte("script.py")},
+			want: "script.py",
+		},
+		{
+			name: "flag only, no script",
+			args: [][]byte{[]byte("-c"), []byte("-e")},
+			want: "",
+		},
+		{
+			name: "empty args",
+			args: [][]byte{},
+			want: "",
+		},
+		{
+			name: "empty strings in args",
+			args: [][]byte{[]byte(""), []byte("")},
+			want: "",
+		},
+		{
+			name: "bash -c with inline command",
+			args: [][]byte{[]byte("-c"), []byte("rm -rf /")},
+			want: "rm -rf /",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findScriptInArgs(tt.args)
+			if got != tt.want {
+				t.Errorf("findScriptInArgs() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

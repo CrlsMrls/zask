@@ -2,8 +2,13 @@
 //
 // The engine processes execution events through a decision cascade:
 //   - Tier 1: Internal LRU cache keyed by inode (fast-path ignore for known-good)
-//   - Tier 2: Static rule engine with regex-based pattern matching and hot-reload
+//   - Tier 2: Static rule engine with CEL-based conditions
 //   - Tier 3: AI queue routing for suspicious events
+//
+// Additional capabilities:
+//   - Script/Interpreter Awareness: detects interpreters (python3, bash, etc.)
+//     and evaluates rules against the script's identity instead of the interpreter.
+//   - Operational Modes: Monitor (log-only) vs. Lockdown (enforce).
 //
 // Events pass through tiers sequentially. The first tier that matches
 // determines the action; remaining tiers are skipped.
@@ -13,16 +18,29 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"regexp"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/common/types"
 	"github.com/rs/zerolog"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 
 	zaskebpf "github.com/CrlsMrls/zask/internal/ebpf"
+)
+
+// Mode represents the daemon's operational mode.
+type Mode string
+
+const (
+	// ModeLockdown enforces all BLOCK decisions (SIGKILL + verdict map).
+	ModeLockdown Mode = "lockdown"
+	// ModeMonitor logs decisions but does not enforce (no SIGKILL, no map writes).
+	ModeMonitor Mode = "monitor"
 )
 
 // Action represents the enforcement outcome for an event.
@@ -43,6 +61,13 @@ const (
 // used both in Action.String() and when matching rule actions from YAML.
 const actionBlockLabel = "BLOCK"
 
+// actionAllowLabel is the canonical string representation of an ALLOW action.
+// ALLOW rules explicitly whitelist binaries: the inode is added to the Tier 1
+// cache and the event skips Tier 3 AI analysis. Rule ordering matters — the
+// first matching rule wins, so place BLOCK rules before ALLOW rules if there
+// is overlap.
+const actionAllowLabel = "ALLOW"
+
 // String returns a human-readable action label.
 func (a Action) String() string {
 	switch a {
@@ -61,36 +86,70 @@ func (a Action) String() string {
 
 // Verdict is the result of processing an event through the engine.
 type Verdict struct {
-	RuleName string // populated for Tier 2 matches
-	Action   Action
-	Tier     int
+	RuleName   string // populated for Tier 2 matches
+	ScriptPath string // resolved script path for interpreter events; empty for non-interpreter binaries
+	Action     Action
+	Tier       int
 }
 
 // Engine is the multi-tiered policy engine.
 type Engine struct {
-	cache   *InodeCache
-	rules   *RuleEngine
-	limiter *rate.Limiter
-	loader  *zaskebpf.Loader
-	aiQueue chan<- zaskebpf.ZaskEvent
-	log     zerolog.Logger
+	log          zerolog.Logger
+	cache        *InodeCache
+	rules        *RuleEngine
+	limiter      *rate.Limiter
+	loader       *zaskebpf.Loader
+	aiQueue      chan<- zaskebpf.ZaskEvent
+	interpreters map[string]bool
+	mode         Mode
 }
 
 // EngineOptions configures the policy engine.
 type EngineOptions struct {
-	Loader    *zaskebpf.Loader
-	AIQueue   chan<- zaskebpf.ZaskEvent
-	RulesPath string
-	CacheTTL  time.Duration
-	RateLimit float64
-	CacheSize int
-	RateBurst int
-	HotReload bool
+	Loader       *zaskebpf.Loader
+	AIQueue      chan<- zaskebpf.ZaskEvent
+	RulesPath    string
+	Mode         Mode
+	Interpreters []string
+	CacheTTL     time.Duration
+	RateLimit    float64
+	CacheSize    int
+	RateBurst    int
+	HotReload    bool
+}
+
+// defaultInterpreters is the set of known script interpreters used when
+// no explicit list is provided via configuration.
+var defaultInterpreters = []string{
+	"python3", "python", "python2",
+	"bash", "sh", "zsh", "dash", "fish",
+	"node", "nodejs",
+	"ruby", "perl", "php", "lua",
+}
+
+// buildInterpreterSet constructs the interpreter lookup map from a list
+// of names or paths. Each entry is indexed by its basename so that both
+// full paths ("/usr/bin/python3") and bare names ("python3") match
+// against filepath.Base(argv).
+func buildInterpreterSet(entries []string) map[string]bool {
+	m := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		name := filepath.Base(e)
+		m[name] = true
+	}
+	return m
 }
 
 // New creates a new policy engine with all three tiers configured.
 func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 	engineLog := log.With().Str("component", "engine").Logger()
+
+	// Operational mode (default: lockdown).
+	mode := opts.Mode
+	if mode == "" {
+		mode = ModeLockdown
+	}
+	engineLog.Info().Str("mode", string(mode)).Msg("operational mode")
 
 	// Tier 1: LRU cache
 	cacheTTL := opts.CacheTTL
@@ -109,23 +168,41 @@ func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 		if err := rules.LoadFromFile(opts.RulesPath); err != nil {
 			return nil, fmt.Errorf("load rules from %s: %w", opts.RulesPath, err)
 		}
-		if opts.HotReload {
-			if err := rules.WatchFile(opts.RulesPath); err != nil {
-				return nil, fmt.Errorf("watch rules file %s: %w", opts.RulesPath, err)
-			}
+	}
+
+	// Wire cache invalidation: when rules are reloaded, all cached
+	// "known-good" inodes must be re-evaluated against the new rule set.
+	rules.onReload = func() {
+		engineLog.Info().Msg("rules reloaded, clearing inode cache")
+		cache.Clear()
+	}
+
+	if opts.RulesPath != "" && opts.HotReload {
+		if err := rules.WatchFile(opts.RulesPath); err != nil {
+			return nil, fmt.Errorf("watch rules file %s: %w", opts.RulesPath, err)
 		}
 	}
 
 	// Tier 3: Rate limiter for AI queue
 	limiter := rate.NewLimiter(rate.Limit(opts.RateLimit), opts.RateBurst)
 
+	// Interpreter set (configurable or default).
+	interps := opts.Interpreters
+	if len(interps) == 0 {
+		interps = defaultInterpreters
+	}
+	interpreterSet := buildInterpreterSet(interps)
+	engineLog.Info().Int("count", len(interpreterSet)).Msg("interpreter set loaded")
+
 	return &Engine{
-		cache:   cache,
-		rules:   rules,
-		limiter: limiter,
-		loader:  opts.Loader,
-		aiQueue: opts.AIQueue,
-		log:     engineLog,
+		cache:        cache,
+		rules:        rules,
+		limiter:      limiter,
+		loader:       opts.Loader,
+		aiQueue:      opts.AIQueue,
+		log:          engineLog,
+		mode:         mode,
+		interpreters: interpreterSet,
 	}, nil
 }
 
@@ -133,31 +210,87 @@ func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 // It returns the verdict and executes any enforcement actions (SIGKILL, map update).
 func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 	key := ev.InodeKey()
+	argv := ev.GetArgv()
+	scriptArgv := ev.GetScriptArgv()
+
+	// resolvedScript tracks the script path determined during interpreter
+	// detection. It is returned in the Verdict so the caller can use the
+	// correct value for audit logging (the event's ScriptArgv field may
+	// hold stale pre-exec data from the eBPF layer).
+	var resolvedScript string
+
+	// Script/Interpreter Awareness (§2b.2): if the binary is a known
+	// interpreter, resolve the script's identity for caching/blocking.
+	//
+	// We prefer /proc/[pid]/cmdline over the eBPF-captured script_argv
+	// because the eBPF hook fires during bprm_check_security, before the
+	// exec replaces the process's memory map. At that point task->mm
+	// still holds the parent's (forking shell's) argv layout, so the
+	// captured argv[1] is from the wrong process. /proc/[pid]/cmdline
+	// is read after exec completes and reflects the actual interpreter
+	// invocation.
+	binaryName := filepath.Base(argv)
+	if e.interpreters[binaryName] {
+		// Prefer procfs — the authoritative source once exec completes.
+		scriptPath := zaskebpf.FindScriptPath(ev.Pid)
+		if scriptPath == "" {
+			// Process may have exited before we could read /proc.
+			// Fall back to the eBPF-captured value as a best-effort.
+			scriptPath = scriptArgv
+			if strings.HasPrefix(scriptPath, "-") {
+				scriptPath = "" // Flag, not a path.
+			}
+		}
+
+		if scriptPath != "" {
+			resolvedScript = scriptPath
+			// Update the event's ScriptArgv so CEL rules see the
+			// resolved script path.
+			if scriptPath != scriptArgv {
+				e.setScriptArgv(&ev, scriptPath)
+			}
+			scriptKey, err := zaskebpf.ResolvePathToInode(scriptPath)
+			if err != nil {
+				e.log.Debug().
+					Err(err).
+					Str("script", scriptPath).
+					Msg("failed to resolve script inode, falling back to interpreter inode")
+			} else {
+				key = scriptKey
+			}
+		}
+	}
 
 	// Tier 1: Cache lookup (fast-path ignore for known-good inodes).
 	if e.cache.Contains(key) {
 		e.log.Debug().
 			Uint64("inode", key.InodeNumber).
 			Msg("tier 1 cache hit — skipping")
-		return Verdict{Action: ActionAllow, Tier: 1}
+		return Verdict{Action: ActionAllow, Tier: 1, ScriptPath: resolvedScript}
 	}
 
 	// Tier 2: Static rule matching.
-	argv := ev.GetArgv()
-	if match, rule := e.rules.Match(argv); match {
+	if match, rule := e.rules.Match(ev); match {
 		action := ActionAlert
-		if rule.Action == actionBlockLabel {
+		switch rule.Action {
+		case actionBlockLabel:
 			action = ActionBlock
 			e.enforce(ev, key)
+		case actionAllowLabel:
+			// Explicit ALLOW: cache the inode as known-good and skip Tier 3.
+			action = ActionAllow
+			e.cache.Add(key)
 		}
 		e.log.Warn().
 			Str("rule", rule.Name).
 			Str("action", rule.Action).
 			Str("severity", rule.Severity).
+			Str("mode", string(e.mode)).
 			Uint32("pid", ev.Pid).
 			Str("argv", argv).
+			Str("script", resolvedScript).
 			Msg("tier 2 rule matched")
-		return Verdict{Action: action, Tier: 2, RuleName: rule.Name}
+		return Verdict{Action: action, Tier: 2, RuleName: rule.Name, ScriptPath: resolvedScript}
 	}
 
 	// No rule match — add to Tier 1 cache as known-good and route to Tier 3.
@@ -171,9 +304,9 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 				Uint32("pid", ev.Pid).
 				Str("argv", argv).
 				Msg("event routed to tier 3 AI queue")
-			return Verdict{Action: ActionAIQueue, Tier: 3}
+			return Verdict{Action: ActionAIQueue, Tier: 3, ScriptPath: resolvedScript}
 		case <-ctx.Done():
-			return Verdict{Action: ActionAllow, Tier: 3}
+			return Verdict{Action: ActionAllow, Tier: 3, ScriptPath: resolvedScript}
 		default:
 			e.log.Warn().Msg("tier 3 AI queue full, defaulting to ALLOW")
 		}
@@ -181,12 +314,21 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 		e.log.Warn().Msg("tier 3 rate limit exceeded, defaulting to ALLOW")
 	}
 
-	return Verdict{Action: ActionAllow, Tier: 3}
+	return Verdict{Action: ActionAllow, Tier: 3, ScriptPath: resolvedScript}
 }
 
 // enforce sends SIGKILL to the offending process and writes a BLOCK
-// entry into the verdict map.
+// entry into the verdict map. In Monitor mode, it only logs.
 func (e *Engine) enforce(ev zaskebpf.ZaskEvent, key zaskebpf.ZaskInodeKey) {
+	if e.mode == ModeMonitor {
+		e.log.Warn().
+			Uint32("pid", ev.Pid).
+			Uint64("inode", key.InodeNumber).
+			Str("argv", ev.GetArgv()).
+			Msg("monitor mode: would have blocked (no enforcement)")
+		return
+	}
+
 	// Send SIGKILL to the process.
 	if err := syscall.Kill(int(ev.Pid), syscall.SIGKILL); err != nil {
 		e.log.Error().Err(err).Uint32("pid", ev.Pid).Msg("failed to kill process")
@@ -205,6 +347,19 @@ func (e *Engine) enforce(ev zaskebpf.ZaskEvent, key zaskebpf.ZaskInodeKey) {
 // Close releases engine resources (stops file watcher, etc.).
 func (e *Engine) Close() {
 	e.rules.Close()
+}
+
+// setScriptArgv overwrites the event's ScriptArgv field with the given
+// string so that downstream CEL rules see the resolved script path.
+func (e *Engine) setScriptArgv(ev *zaskebpf.ZaskEvent, path string) {
+	// Zero out the field.
+	for i := range ev.ScriptArgv {
+		ev.ScriptArgv[i] = 0
+	}
+	// Copy the path (truncated to field size).
+	for i := 0; i < len(path) && i < len(ev.ScriptArgv); i++ {
+		ev.ScriptArgv[i] = int8(path[i])
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -290,18 +445,28 @@ func (c *InodeCache) Size() int {
 	return len(c.entries)
 }
 
+// Clear removes all entries from the cache. This is used when rules are
+// reloaded so that previously-cached "known-good" inodes are re-evaluated
+// against the new rule set.
+func (c *InodeCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[zaskebpf.ZaskInodeKey]time.Time, c.maxSize)
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2: Static Rule Engine
 // ---------------------------------------------------------------------------
 
 // Rule is a single static detection rule from rules.yaml.
+// Each rule contains a CEL expression that is evaluated against event attributes.
 type Rule struct {
-	compiled    *regexp.Regexp `yaml:"-"`
-	Name        string         `yaml:"name"`
-	Description string         `yaml:"description"`
-	Pattern     string         `yaml:"pattern"`
-	Action      string         `yaml:"action"`
-	Severity    string         `yaml:"severity"`
+	celProgram  cel.Program `yaml:"-"`
+	Name        string      `yaml:"name"`
+	Description string      `yaml:"description"`
+	Condition   string      `yaml:"condition"`
+	Action      string      `yaml:"action"`
+	Severity    string      `yaml:"severity"`
 }
 
 // rulesFile is the top-level structure of rules.yaml.
@@ -309,13 +474,33 @@ type rulesFile struct {
 	Rules []Rule `yaml:"rules"`
 }
 
+// celEnv is the shared CEL environment with the event attribute declarations.
+var celEnv *cel.Env
+
+func init() {
+	var err error
+	celEnv, err = cel.NewEnv(
+		cel.Variable("argv", cel.StringType),
+		cel.Variable("script_path", cel.StringType),
+		cel.Variable("pid", cel.IntType),
+		cel.Variable("ppid", cel.IntType),
+		cel.Variable("uid", cel.IntType),
+		cel.Variable("cgroup_id", cel.IntType),
+		cel.Variable("inode", cel.IntType),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create CEL environment: %v", err))
+	}
+}
+
 // RuleEngine manages static detection rules and supports hot-reload.
 type RuleEngine struct {
-	log     zerolog.Logger
-	stopCh  chan struct{}
-	rules   []Rule
-	mu      sync.RWMutex
-	stopped bool
+	log      zerolog.Logger
+	onReload func() // called after successful rule reload; may be nil
+	stopCh   chan struct{}
+	rules    []Rule
+	mu       sync.RWMutex
+	stopped  bool
 }
 
 // NewRuleEngine creates a new rule engine.
@@ -342,13 +527,24 @@ func (r *RuleEngine) LoadFromBytes(data []byte) error {
 		return fmt.Errorf("parse rules: %w", err)
 	}
 
-	// Compile all regex patterns.
+	// Compile all CEL conditions.
 	for i := range rf.Rules {
-		compiled, err := regexp.Compile(rf.Rules[i].Pattern)
-		if err != nil {
-			return fmt.Errorf("compile pattern for rule %q: %w", rf.Rules[i].Name, err)
+		rule := &rf.Rules[i]
+		if rule.Condition == "" {
+			return fmt.Errorf("rule %q: 'condition' field is required", rule.Name)
 		}
-		rf.Rules[i].compiled = compiled
+		ast, issues := celEnv.Compile(rule.Condition)
+		if issues != nil && issues.Err() != nil {
+			return fmt.Errorf("compile CEL condition for rule %q: %w", rule.Name, issues.Err())
+		}
+		if ast.OutputType() != cel.BoolType {
+			return fmt.Errorf("CEL condition for rule %q must evaluate to bool, got %s", rule.Name, ast.OutputType())
+		}
+		prg, err := celEnv.Program(ast)
+		if err != nil {
+			return fmt.Errorf("create CEL program for rule %q: %w", rule.Name, err)
+		}
+		rule.celProgram = prg
 	}
 
 	r.mu.Lock()
@@ -356,16 +552,37 @@ func (r *RuleEngine) LoadFromBytes(data []byte) error {
 	r.mu.Unlock()
 
 	r.log.Info().Int("count", len(rf.Rules)).Msg("rules loaded")
+
+	// Notify the engine so it can clear caches for the new rule set.
+	if r.onReload != nil {
+		r.onReload()
+	}
+
 	return nil
 }
 
-// Match checks argv against all loaded rules and returns the first match.
-func (r *RuleEngine) Match(argv string) (bool, Rule) {
+// Match checks an event against all loaded rules and returns the first match.
+func (r *RuleEngine) Match(ev zaskebpf.ZaskEvent) (bool, Rule) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	activation := map[string]any{
+		"argv":        ev.GetArgv(),
+		"script_path": ev.GetScriptArgv(),
+		"pid":         int64(ev.Pid),
+		"ppid":        int64(ev.Ppid),
+		"uid":         int64(ev.Uid),
+		"cgroup_id":   int64(ev.CgroupId),
+		"inode":       int64(ev.InodeNumber),
+	}
+
 	for _, rule := range r.rules {
-		if rule.compiled != nil && rule.compiled.MatchString(argv) {
+		out, _, err := rule.celProgram.Eval(activation)
+		if err != nil {
+			r.log.Error().Err(err).Str("rule", rule.Name).Msg("CEL evaluation error")
+			continue
+		}
+		if out == types.True {
 			return true, rule
 		}
 	}

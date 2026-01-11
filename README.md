@@ -11,7 +11,7 @@ ZASK operates a multi-tiered enforcement model:
 | Tier | Layer | Mechanism | Latency | Purpose |
 |------|-------|-----------|---------|---------|
 | **1** | Kernel | eBPF LSM + Inode Map | < 1μs | Instant blocking of known-malicious binaries |
-| **2** | User-space | Deterministic Engine | < 10ms | Configured policy matching (regex, UID, cgroups) |
+| **2** | User-space | Deterministic Engine | < 10ms | CEL policy matching, script-aware interpreter detection |
 | **3** | Intelligence | LLM Semantic Loop | 1–5s | AI analysis of process intent and judge |
 
 
@@ -19,6 +19,36 @@ How the LLM-as-a-Judge Framework Works:
 - The Telemetry: The kernel provides the raw "facts" (syscalls, inodes, arguments).
 - The Referral: When Tier 2 sees something it can't definitively call "good" or "bad," it refers the case to the Judge.
 - The Verdict: The LLM issues an Enforcement Verdict (Block vs. Allow) based on its understanding of exploit patterns.
+
+### Enforcement Modes
+
+- **Lockdown** (default) — enforces verdicts by killing processes and updating the kernel block map.
+- **Monitor** — evaluates all tiers and emits audit events but never enforces, useful for dry-run deployments.
+
+### CEL Policy Rules
+
+Tier 2 rules support [CEL (Common Expression Language)](https://github.com/google/cel-go) expressions that can combine multiple event attributes — `argv`, `script_path`, `pid`, `uid`, `cgroup_id`, and more — in a single condition:
+
+```yaml
+- name: tmp-root-script
+  condition: 'script_path.startsWith("/tmp/") && uid == 0'
+  action: BLOCK
+  severity: critical
+```
+
+### Script-Aware Interpreter Detection
+
+When an interpreter executes a script, ZASK extracts `argv[1]` directly in eBPF and resolves the script's inode. If `argv[1]` is a flag (e.g., `-u`), the engine falls back to `/proc/[pid]/cmdline` to find the actual script path. Rules can then match on `script_path` in addition to the binary path, catching threats like `python3 -u /tmp/payload.py`.
+
+Interpreters are detected by matching `basename(argv)` against a configurable set (default: `python3`, `python`, `bash`, `sh`, `zsh`, `dash`, `fish`, `node`, `nodejs`, `ruby`, `perl`, `php`, `lua`). The list can be customised via `spec.interpreters` in the config file, accepting both bare names and full paths. Non-interpreter binaries follow the standard execution path — all binaries are evaluated through every tier regardless. See [Configuration](docs/configuration.md) and [Architecture](docs/architecture.md) for details.
+
+### Multi-Format Audit Logging
+
+Security events are written to one or more audit outputs simultaneously:
+
+- **JSON** (NDJSON) — for log pipelines and SIEM ingestion
+- **Parquet** — columnar format for analytics and long-term storage
+- **Text** — human-readable console output
 
 ## Prerequisites
 
@@ -132,6 +162,8 @@ docs/               — Documentation
 
 ## Documentation
 
+- [Architecture](docs/architecture.md)
+- [Configuration Reference](docs/configuration.md)
 - [Kernel Requirements](docs/kernel-requirements.md)
 - [Lima Development Guide](docs/lima-dev-guide.md)
 - [Kubernetes Node Preparation](docs/k8s-node-preparation.md)

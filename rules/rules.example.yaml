@@ -11,21 +11,50 @@
 #
 #   name:        Unique human-readable identifier (used in audit logs)
 #   description: What the rule detects (for documentation)
-#   pattern:     Go regex (re2) matched against the full argv string
+#   condition:   CEL expression evaluated against event attributes
 #   action:      BLOCK — kill process + write verdict map entry
+#                ALLOW — explicitly whitelist; cache inode + skip AI analysis
 #                ALERT — log warning but allow execution
 #   severity:    critical | high | medium | low (for prioritization)
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# Pattern Tips
+# Rule Ordering (First Match Wins)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# - Patterns use Go's regexp (RE2 syntax, no lookahead/lookbehind)
-# - The pattern is matched against the full argv string captured by the
-#   eBPF LSM hook (bprm_check_security)
-# - Use \s+ for whitespace matching (handles tabs and multiple spaces)
-# - Test patterns with: go run -mod=mod golang.org/dl/gotip test -run TestRegex
-# - Avoid overly broad patterns — false positives cause blocked legitimate tasks
+# Rules are evaluated top-to-bottom. The first matching rule determines the
+# action — remaining rules are skipped. This means:
+#
+#   1. Place BLOCK rules BEFORE ALLOW rules for overlapping conditions.
+#   2. Place narrow/specific rules before broad/catchall rules.
+#   3. A broad ALLOW rule at the end acts as a "default allow" for system bins.
+#
+# Example (correct ordering):
+#   - BLOCK: argv.contains("nc") && uid == 0        ← specific threat
+#   - BLOCK: script_path.startsWith("/tmp/")         ← specific policy
+#   - ALLOW: argv.startsWith("/usr/bin/")            ← broad system catchall
+#
+# Example (WRONG — ALLOW hides the BLOCK):
+#   - ALLOW: argv.startsWith("/usr/bin/")            ← matches /usr/bin/nc first!
+#   - BLOCK: argv.contains("nc") && uid == 0        ← never reached for /usr/bin/nc
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CEL Variables
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# CEL conditions have access to the following event attributes:
+#
+#   argv        (string) — executable binary path (e.g., "/usr/bin/python3")
+#   script_path (string) — resolved script path when interpreter detected (eBPF + procfs)
+#   pid         (int)    — process ID
+#   ppid        (int)    — parent process ID
+#   uid         (int)    — user ID
+#   cgroup_id   (int)    — cgroup ID (distinguishes host vs. container)
+#   inode       (int)    — binary inode number
+#
+# CEL supports rich expressions:
+#   argv.contains("nc") && uid == 0
+#   script_path.startsWith("/tmp/")
+#   uid != 0 && argv.matches("chmod.*\\+s")
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Hot-Reload
@@ -36,8 +65,8 @@
 #
 #   kill -HUP $(pidof zaskd)
 #
-# Invalid YAML or regex patterns in a reload are logged as errors and the
-# previous valid ruleset is preserved.
+# Invalid YAML or CEL expressions in a reload are logged as
+# errors and the previous valid ruleset is preserved.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -46,19 +75,27 @@ rules:
 
   - name: reverse-shell-netcat
     description: "Detects netcat-based reverse shells (nc -e /bin/sh)"
-    pattern: 'nc\s+.*-e\s+/bin/(sh|bash)'
+    condition: 'argv.contains("nc") && argv.contains("-e") && (argv.contains("/bin/sh") || argv.contains("/bin/bash"))'
     action: BLOCK
     severity: critical
 
   - name: reverse-shell-bash-tcp
     description: "Detects bash /dev/tcp reverse shells"
-    pattern: '/dev/tcp/\d+\.\d+\.\d+\.\d+/\d+'
+    condition: 'argv.contains("/dev/tcp/")'
     action: BLOCK
     severity: critical
 
   - name: reverse-shell-python
     description: "Detects Python-based reverse shells using socket+pty"
-    pattern: 'python[23]?\s+.*import\s+(socket|pty|subprocess).*connect'
+    condition: 'argv.matches("python[23]?") && argv.contains("import") && (argv.contains("socket") || argv.contains("pty"))'
+    action: BLOCK
+    severity: critical
+
+  # ── Script Execution from World-Writable Paths (Critical) ──────────────
+
+  - name: tmp-script-execution
+    description: "Detects scripts executed from /tmp by root (common post-exploit)"
+    condition: 'script_path.startsWith("/tmp/") && uid == 0'
     action: BLOCK
     severity: critical
 
@@ -66,45 +103,92 @@ rules:
 
   - name: base64-decode-exec
     description: "Detects base64-decoded command execution piped to shell"
-    pattern: 'base64\s+(-d|--decode)\s*\|.*sh'
+    condition: 'argv.contains("base64") && (argv.contains("-d") || argv.contains("--decode")) && argv.contains("sh")'
     action: ALERT
     severity: high
 
   - name: curl-pipe-shell
     description: "Detects curl/wget piped directly to a shell interpreter"
-    pattern: '(curl|wget)\s+.*\|\s*(ba)?sh'
+    condition: '(argv.contains("curl") || argv.contains("wget")) && argv.contains("|") && (argv.contains("sh") || argv.contains("bash"))'
     action: ALERT
     severity: high
 
   # ── Privilege Escalation (High) ────────────────────────────────────────
 
-  # Example: detect attempts to chmod binaries to setuid
+  # CEL example: detect attempts to chmod binaries to setuid
   # Uncomment if applicable to your environment:
   #
   # - name: setuid-chmod
   #   description: "Detects chmod +s (setuid bit) on executables"
-  #   pattern: 'chmod\s+.*\+s\s+'
+  #   condition: 'argv.contains("chmod") && argv.contains("+s")'
   #   action: ALERT
   #   severity: high
 
   # ── Container Escape (Critical) ────────────────────────────────────────
 
-  # Example: detect nsenter usage which can escape container namespaces
-  # Uncomment if running in containerized environments:
+  # CEL example with multi-attribute condition:
+  # Uncomment if running containerized workloads:
   #
   # - name: nsenter-escape
   #   description: "Detects nsenter targeting PID 1 namespace"
-  #   pattern: 'nsenter\s+.*-t\s+1\s+'
+  #   condition: 'argv.contains("nsenter") && argv.contains("-t") && argv.contains("1")'
   #   action: BLOCK
   #   severity: critical
 
   # ── Crypto Mining (Medium) ─────────────────────────────────────────────
 
-  # Example: detect common crypto mining arguments
   # Uncomment to enable:
   #
   # - name: crypto-miner-stratum
   #   description: "Detects stratum protocol connections (crypto mining)"
-  #   pattern: 'stratum\+tcp://'
+  #   condition: 'argv.contains("stratum+tcp://")'
   #   action: BLOCK
   #   severity: medium
+
+  # ── UID-Gated Rules (CEL Multi-Attribute Examples) ─────────────────────
+
+  # CEL makes it easy to combine multiple event fields:
+  #
+  # - name: non-root-suid-attempt
+  #   description: "Non-root user attempting setuid-related operations"
+  #   condition: 'uid != 0 && argv.matches("chmod.*\\+s")'
+  #   action: ALERT
+  #   severity: high
+  #
+  # - name: container-suspicious-binary
+  #   description: "Detect suspect binaries inside containers (cgroup_id > 1)"
+  #   condition: 'cgroup_id > 1 && (argv.contains("nmap") || argv.contains("masscan"))'
+  #   action: BLOCK
+  #   severity: high
+
+  # ── Explicit ALLOW Rules ───────────────────────────────────────────────
+  #
+  # ALLOW rules whitelist binaries at Tier 2. When matched, the binary's
+  # inode is added to the Tier 1 cache and the event skips Tier 3 AI
+  # analysis entirely. This is critical for reducing noise from trusted
+  # system binaries and improving overall processing throughput.
+  #
+  # REMEMBER: First match wins. Place all BLOCK/ALERT rules ABOVE the
+  # ALLOW section so threats are caught before the catchall.
+
+  # Allow a specific binary by exact path:
+  - name: allow-containerd
+    description: "Explicitly allow the container runtime"
+    condition: 'argv == "/usr/bin/containerd"'
+    action: ALLOW
+    severity: low
+
+  # Allow all standard system binaries (broad catchall — place last):
+  - name: allow-system-bins
+    description: "Allow standard system binaries to reduce Tier 3 AI noise"
+    condition: 'argv.startsWith("/usr/bin/") || argv.startsWith("/usr/sbin/") || argv.startsWith("/bin/") || argv.startsWith("/sbin/") || argv.startsWith("/usr/lib")'
+    action: ALLOW
+    severity: low
+
+  # Narrow ALLOW for CI/CD — trust the build toolchain only:
+  #
+  # - name: allow-ci-toolchain
+  #   description: "Allow CI build tools in /opt/ci"
+  #   condition: 'argv.startsWith("/opt/ci/bin/")'
+  #   action: ALLOW
+  #   severity: low

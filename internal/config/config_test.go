@@ -78,6 +78,57 @@ kind: ZaskConfig
 	if cfg.Spec.Health.ListenAddress != ":7453" {
 		t.Errorf("default Health.ListenAddress = %q, want %q", cfg.Spec.Health.ListenAddress, ":7453")
 	}
+	if cfg.Spec.Mode != "lockdown" {
+		t.Errorf("default Mode = %q, want %q", cfg.Spec.Mode, "lockdown")
+	}
+	if len(cfg.Spec.Audit.Outputs) != 1 {
+		t.Fatalf("default Audit.Outputs length = %d, want 1", len(cfg.Spec.Audit.Outputs))
+	}
+	if cfg.Spec.Audit.Outputs[0].Format != "json" {
+		t.Errorf("default Audit.Outputs[0].Format = %q, want %q", cfg.Spec.Audit.Outputs[0].Format, "json")
+	}
+	if len(cfg.Spec.Interpreters) == 0 {
+		t.Fatal("default Interpreters list is empty, want non-empty")
+	}
+	// Verify a few well-known defaults are present.
+	want := map[string]bool{"python3": false, "bash": false, "node": false}
+	for _, name := range cfg.Spec.Interpreters {
+		if _, ok := want[name]; ok {
+			want[name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("default Interpreters missing %q", name)
+		}
+	}
+}
+
+func TestLoad_CustomInterpreters(t *testing.T) {
+	content := `
+apiVersion: zask.io/v1alpha1
+kind: ZaskConfig
+spec:
+  interpreters:
+    - /usr/bin/python3
+    - ruby
+`
+	path := writeTempFile(t, "config.yaml", content)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.Spec.Interpreters) != 2 {
+		t.Fatalf("Interpreters length = %d, want 2", len(cfg.Spec.Interpreters))
+	}
+	if cfg.Spec.Interpreters[0] != "/usr/bin/python3" {
+		t.Errorf("Interpreters[0] = %q, want %q", cfg.Spec.Interpreters[0], "/usr/bin/python3")
+	}
+	if cfg.Spec.Interpreters[1] != "ruby" {
+		t.Errorf("Interpreters[1] = %q, want %q", cfg.Spec.Interpreters[1], "ruby")
+	}
 }
 
 func TestLoad_MissingFile(t *testing.T) {
@@ -161,6 +212,80 @@ func TestValidate_MissingHealthAddress(t *testing.T) {
 	cfg.Spec.Health.ListenAddress = ""
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() expected error for empty health listenAddress")
+	}
+}
+
+func TestValidate_InvalidMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Spec.Mode = "invalid"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() expected error for invalid mode")
+	}
+}
+
+func TestValidate_MonitorMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Spec.Mode = "monitor"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error for monitor mode: %v", err)
+	}
+}
+
+func TestValidate_InvalidAuditFormat(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Spec.Audit.Outputs = []AuditOutput{{Format: "xml", Path: "/tmp/audit.xml"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() expected error for invalid audit format")
+	}
+}
+
+func TestValidate_EmptyAuditPath(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Spec.Audit.Outputs = []AuditOutput{{Format: "json", Path: ""}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() expected error for empty audit path")
+	}
+}
+
+func TestSelfProtectionEnabled_DefaultsToTrue(t *testing.T) {
+	cfg := DefaultConfig()
+	if !cfg.Spec.SelfProtectionEnabled() {
+		t.Fatal("SelfProtectionEnabled() = false, want true when nil")
+	}
+}
+
+func TestSelfProtectionEnabled_ExplicitFalse(t *testing.T) {
+	cfg := DefaultConfig()
+	f := false
+	cfg.Spec.SelfProtection = &f
+	if cfg.Spec.SelfProtectionEnabled() {
+		t.Fatal("SelfProtectionEnabled() = true, want false when set to false")
+	}
+}
+
+func TestSelfProtectionEnabled_ExplicitTrue(t *testing.T) {
+	cfg := DefaultConfig()
+	tr := true
+	cfg.Spec.SelfProtection = &tr
+	if !cfg.Spec.SelfProtectionEnabled() {
+		t.Fatal("SelfProtectionEnabled() = false, want true when set to true")
+	}
+}
+
+func TestSelfProtectionEnabled_FromYAML(t *testing.T) {
+	content := `
+apiVersion: zask.io/v1alpha1
+kind: ZaskConfig
+spec:
+  selfProtection: false
+`
+	path := writeTempFile(t, "config.yaml", content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Spec.SelfProtectionEnabled() {
+		t.Fatal("SelfProtectionEnabled() = true after loading selfProtection: false from YAML")
 	}
 }
 

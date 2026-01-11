@@ -8,7 +8,6 @@ package ebpf
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -42,16 +41,29 @@ func NewLoader(opts LoaderOptions, log zerolog.Logger) (*Loader, error) {
 	}
 
 	collOpts := &ebpf.CollectionOptions{}
-	// If a pin path is specified, try to recover existing pinned maps
-	// (daemon restart scenario). Set the pin path on the collection so
-	// LoadAndAssign reuses existing maps from the BPF filesystem.
-	if l.pinPath != "" {
-		pinDir := filepath.Dir(l.pinPath)
-		collOpts.Maps.PinPath = pinDir
 
-		// Check if pinned map already exists — if so, we're reattaching.
+	// If a pin path is specified, try to recover the existing pinned map
+	// (daemon restart scenario). We use MapReplacements to inject the
+	// recovered map so the loaded programs reference the same FD.
+	//
+	// NOTE: We intentionally do NOT use collOpts.Maps.PinPath because
+	// that mechanism looks for files named after the C map identifier
+	// ("verdict_map"), whereas we pin at a custom path ("zask_verdicts").
+	var pinRecovered bool
+	if l.pinPath != "" {
 		if _, err := os.Stat(l.pinPath); err == nil {
-			l.log.Info().Str("path", l.pinPath).Msg("found existing pinned verdict map, recovering")
+			existing, err := ebpf.LoadPinnedMap(l.pinPath, nil)
+			if err != nil {
+				l.log.Warn().Err(err).Str("path", l.pinPath).
+					Msg("failed to recover pinned verdict map, starting fresh")
+			} else {
+				l.log.Info().Str("path", l.pinPath).
+					Msg("recovered existing pinned verdict map")
+				collOpts.MapReplacements = map[string]*ebpf.Map{
+					"verdict_map": existing,
+				}
+				pinRecovered = true
+			}
 		}
 	}
 
@@ -59,14 +71,11 @@ func NewLoader(opts LoaderOptions, log zerolog.Logger) (*Loader, error) {
 		return nil, fmt.Errorf("load ebpf objects: %w", err)
 	}
 
-	// Pin the verdict map if a path is specified and it's not already pinned.
-	if l.pinPath != "" {
+	// Pin the verdict map only if it wasn't already pinned.
+	if l.pinPath != "" && !pinRecovered {
 		if err := l.objs.VerdictMap.Pin(l.pinPath); err != nil {
-			// EEXIST is OK — map was already pinned (recovered).
-			if !os.IsExist(err) {
-				l.objs.Close()
-				return nil, fmt.Errorf("pin verdict map to %s: %w", l.pinPath, err)
-			}
+			l.objs.Close()
+			return nil, fmt.Errorf("pin verdict map to %s: %w", l.pinPath, err)
 		}
 	}
 

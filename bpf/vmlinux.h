@@ -91,6 +91,16 @@ struct linux_binprm
 };
 
 /*
+ * Memory management types for argv extraction (§2b.1).
+ * arg_start/arg_end delimit the user-space argv region.
+ */
+struct mm_struct
+{
+  unsigned long arg_start;
+  unsigned long arg_end;
+};
+
+/*
  * Task and credential types for process context
  */
 struct task_struct
@@ -98,6 +108,7 @@ struct task_struct
   int pid;
   int tgid;
   unsigned int flags;
+  struct mm_struct *mm;
   struct task_struct *parent;
   struct task_struct *real_parent; /* biological parent (not changed by ptrace) */
   const struct cred *real_cred;

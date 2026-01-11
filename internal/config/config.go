@@ -14,6 +14,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Format constants used across logging and audit output configuration.
+const (
+	formatJSON    = "json"
+	formatConsole = "console"
+	formatParquet = "parquet"
+	formatText    = "text"
+)
+
 // Config is the top-level declarative configuration for zaskd.
 type Config struct {
 	APIVersion string `yaml:"apiVersion"`
@@ -23,12 +31,16 @@ type Config struct {
 
 // Spec is the main configuration body.
 type Spec struct {
-	Logging     Logging     `yaml:"logging"`
-	MapPaths    MapPaths    `yaml:"mapPaths"`
-	Health      Health      `yaml:"health"`
-	Rules       Rules       `yaml:"rules"`
-	AI          AI          `yaml:"ai"`
-	RateLimiter RateLimiter `yaml:"rateLimiter"`
+	SelfProtection *bool       `yaml:"selfProtection,omitempty"`
+	Logging        Logging     `yaml:"logging"`
+	Mode           string      `yaml:"mode"`
+	MapPaths       MapPaths    `yaml:"mapPaths"`
+	Health         Health      `yaml:"health"`
+	Rules          Rules       `yaml:"rules"`
+	Interpreters   []string    `yaml:"interpreters"`
+	Audit          Audit       `yaml:"audit"`
+	AI             AI          `yaml:"ai"`
+	RateLimiter    RateLimiter `yaml:"rateLimiter"`
 }
 
 // MapPaths configures BPF map pin locations on the BPF filesystem.
@@ -68,18 +80,45 @@ type Rules struct {
 	Path string `yaml:"path"`
 }
 
+// Audit configures multi-format audit logging.
+type Audit struct {
+	Outputs []AuditOutput `yaml:"outputs"`
+}
+
+// AuditOutput configures a single audit log output.
+type AuditOutput struct {
+	Format string `yaml:"format"` // json, parquet, or text
+	Path   string `yaml:"path"`   // file path or "stdout"/"stderr"
+}
+
+// SelfProtectionEnabled returns whether self-protection is enabled.
+// Defaults to true when the field is nil (not set in config).
+func (s *Spec) SelfProtectionEnabled() bool {
+	if s.SelfProtection == nil {
+		return true
+	}
+	return *s.SelfProtection
+}
+
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
 		APIVersion: "zask.io/v1alpha1",
 		Kind:       "ZaskConfig",
 		Spec: Spec{
+			Mode: "lockdown",
+			Interpreters: []string{
+				"python3", "python", "python2",
+				"bash", "sh", "zsh", "dash", "fish",
+				"node", "nodejs",
+				"ruby", "perl", "php", "lua",
+			},
 			MapPaths: MapPaths{
 				VerdictMap: "/sys/fs/bpf/zask_verdicts",
 			},
 			Logging: Logging{
 				Level:  "info",
-				Format: "json",
+				Format: formatJSON,
 				Output: "stdout",
 			},
 			AI: AI{
@@ -95,6 +134,11 @@ func DefaultConfig() Config {
 			},
 			Rules: Rules{
 				Path: "/etc/zask/rules.yaml",
+			},
+			Audit: Audit{
+				Outputs: []AuditOutput{
+					{Format: formatJSON, Path: "/var/log/zask/audit.json"},
+				},
 			},
 		},
 	}
@@ -143,7 +187,7 @@ func (c *Config) Validate() error {
 	}
 
 	switch c.Spec.Logging.Format {
-	case "json", "console":
+	case formatJSON, formatConsole:
 		// valid
 	default:
 		return fmt.Errorf("spec.logging.format %q is invalid, must be \"json\" or \"console\"", c.Spec.Logging.Format)
@@ -167,6 +211,27 @@ func (c *Config) Validate() error {
 
 	if c.Spec.AI.Timeout < 0 {
 		return fmt.Errorf("spec.ai.timeout must be non-negative, got %s", c.Spec.AI.Timeout)
+	}
+
+	// Validate operational mode.
+	switch c.Spec.Mode {
+	case "lockdown", "monitor":
+		// valid
+	default:
+		return fmt.Errorf("spec.mode %q is invalid, must be \"lockdown\" or \"monitor\"", c.Spec.Mode)
+	}
+
+	// Validate audit outputs.
+	for i, out := range c.Spec.Audit.Outputs {
+		switch out.Format {
+		case formatJSON, formatParquet, formatText:
+			// valid
+		default:
+			return fmt.Errorf("spec.audit.outputs[%d].format %q is invalid, must be \"json\", \"parquet\", or \"text\"", i, out.Format)
+		}
+		if out.Path == "" {
+			return fmt.Errorf("spec.audit.outputs[%d].path is required", i)
+		}
 	}
 
 	return nil

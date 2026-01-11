@@ -67,8 +67,9 @@ struct event
   __u32 ppid;
   __u32 uid;
   __u32 device_id;
-  __u8 is_map_hit;     // 1 if verdict_map contained an entry
-  char argv[ARGV_MAX]; // executable filename (truncated to ARGV_MAX)
+  __u8 is_map_hit;            // 1 if verdict_map contained an entry
+  char argv[ARGV_MAX];        // executable filename (truncated to ARGV_MAX)
+  char script_argv[ARGV_MAX]; // raw argv[1] — may be a flag; Go engine resolves via procfs
 };
 
 // ---------------------------------------------------------------------------
@@ -210,14 +211,55 @@ int BPF_PROG(zask_bprm_check, struct linux_binprm *bprm)
     // Source flag (§1.4.4).
     e->is_map_hit = is_map_hit;
 
-    // Argument extraction (§1.2.3).
-    // Read the executable filename from linux_binprm. This
-    // captures the path (e.g. "/usr/bin/python3"). Full argv
-    // parsing requires user-space cooperation and is deferred
-    // to Phase 2. Strings longer than ARGV_MAX are truncated.
+    // Argument extraction (§1.2.3, §2b.1).
+    // Read the executable filename from linux_binprm.
     const char *filename = BPF_CORE_READ(bprm, filename);
     bpf_probe_read_kernel_str(e->argv, sizeof(e->argv),
                               filename);
+
+    // Extract raw argv[1] (§2b.1.2) — for interpreters this is often
+    // the script path, but may be a flag (e.g., "-u"). The Go engine
+    // falls back to /proc/[pid]/cmdline when this value is not a path.
+    // Walk current task's mm->arg_start, skip argv[0], and read argv[1].
+    struct mm_struct *mm = BPF_CORE_READ(task, mm);
+    unsigned long arg_start = 0;
+    unsigned long arg_end = 0;
+    if (mm)
+    {
+      arg_start = BPF_CORE_READ(mm, arg_start);
+      arg_end = BPF_CORE_READ(mm, arg_end);
+    }
+    if (arg_start && arg_end > arg_start)
+    {
+      // Skip argv[0] by scanning for the first NUL byte.
+      // Limit scan to 128 bytes (sufficient for most binary paths).
+      char ch;
+      unsigned long pos = arg_start;
+      unsigned long limit = arg_start + 128;
+      if (limit > arg_end)
+        limit = arg_end;
+
+      // Walk past argv[0] to find the NUL terminator.
+      // Bounded loop — kernel ≥ 5.3 verifier accepts this without unrolling.
+      for (int i = 0; i < 128; i++)
+      {
+        if (pos >= limit)
+          break;
+        if (bpf_probe_read_user(&ch, 1, (void *)pos) != 0)
+          break;
+        pos++;
+        if (ch == '\0')
+        {
+          // pos now points to the start of argv[1].
+          // Only read if there is data remaining.
+          if (pos < arg_end)
+            bpf_probe_read_user_str(e->script_argv,
+                                    sizeof(e->script_argv),
+                                    (void *)pos);
+          break;
+        }
+      }
+    }
 
     bpf_ringbuf_submit(e, 0);
   }

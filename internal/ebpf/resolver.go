@@ -1,8 +1,10 @@
 package ebpf
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -17,6 +19,57 @@ func ResolvePathToInode(path string) (ZaskInodeKey, error) {
 		InodeNumber: stat.Ino,
 		DeviceId:    uint32(stat.Dev),
 	}, nil
+}
+
+// FindScriptPath reads /proc/[pid]/cmdline and returns the first argument
+// that looks like a file path (starts with '/' or './'). This handles
+// interpreters invoked with flags before the script path, e.g.:
+//
+//	python3 -u /tmp/evil.py  → "/tmp/evil.py"
+//	bash -c "rm -rf /"      → "" (no path-like arg)
+//	node ./app.js            → "./app.js"
+//
+// Returns "" if the process has exited or no path-like argument is found.
+// The pid 0 is never read (kernel idle).
+func FindScriptPath(pid uint32) string {
+	if pid == 0 {
+		return ""
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return "" // process already exited — non-fatal
+	}
+	// cmdline is NUL-separated: ["python3", "-u", "/tmp/evil.py", ""]
+	args := bytes.Split(data, []byte{0})
+	// Skip argv[0] (the interpreter itself), scan remaining args.
+	if len(args) > 1 {
+		return findScriptInArgs(args[1:])
+	}
+	return ""
+}
+
+// findScriptInArgs scans a list of command-line arguments (already split)
+// and returns the first that looks like a script path, skipping flags.
+func findScriptInArgs(args [][]byte) string {
+	for _, arg := range args {
+		s := string(arg)
+		if s == "" {
+			continue
+		}
+		// Skip flags (args starting with '-').
+		if strings.HasPrefix(s, "-") {
+			continue
+		}
+		// Accept arguments that look like file paths.
+		if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+			return s
+		}
+		// Also accept bare filenames (e.g., "script.py") — the first
+		// non-flag argument is likely the script in most interpreter
+		// invocations. Stop at the first candidate.
+		return s
+	}
+	return ""
 }
 
 // BlockPath resolves a file path to its inode key and writes a BLOCK

@@ -19,6 +19,13 @@ func TestDecodeEvent_ValidBuffer(t *testing.T) {
 	buf[32] = 1                                   // is_map_hit
 	copy(buf[33:], "/usr/bin/python3")            // argv
 
+	// script_argv starts after argv[256] + padding.
+	// Compute offset: argv is at 33, length 256 → script_argv at 33+256=289.
+	// However, the actual offset depends on struct alignment. We use unsafe
+	// to compute it reliably.
+	scriptArgvOffset := int(unsafe.Offsetof(ZaskEvent{}.ScriptArgv))
+	copy(buf[scriptArgvOffset:], "/tmp/test.py") // script_argv
+
 	ev, err := DecodeEvent(buf)
 	if err != nil {
 		t.Fatalf("DecodeEvent() error = %v", err)
@@ -50,6 +57,11 @@ func TestDecodeEvent_ValidBuffer(t *testing.T) {
 	if argv != "/usr/bin/python3" {
 		t.Errorf("GetArgv() = %q, want %q", argv, "/usr/bin/python3")
 	}
+
+	scriptArgv := ev.GetScriptArgv()
+	if scriptArgv != "/tmp/test.py" {
+		t.Errorf("GetScriptArgv() = %q, want %q", scriptArgv, "/tmp/test.py")
+	}
 }
 
 func TestDecodeEvent_ShortBuffer(t *testing.T) {
@@ -64,6 +76,13 @@ func TestGetArgv_EmptyString(t *testing.T) {
 	ev := ZaskEvent{}
 	if argv := ev.GetArgv(); argv != "" {
 		t.Errorf("GetArgv() = %q, want empty", argv)
+	}
+}
+
+func TestGetScriptArgv_EmptyString(t *testing.T) {
+	ev := ZaskEvent{}
+	if s := ev.GetScriptArgv(); s != "" {
+		t.Errorf("GetScriptArgv() = %q, want empty", s)
 	}
 }
 

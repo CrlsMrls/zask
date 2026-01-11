@@ -17,20 +17,32 @@ func DecodeEvent(raw []byte) (ZaskEvent, error) {
 	return ev, nil
 }
 
-// Argv returns the argv field as a Go string, trimming at the first NUL byte.
+// GetArgv returns the argv field as a Go string, trimming at the first NUL byte.
 func (e *ZaskEvent) GetArgv() string {
-	// Find the first NUL byte to determine string length.
-	n := len(e.Argv)
-	for i, b := range e.Argv {
+	return nullTerminatedInt8ToString(e.Argv[:])
+}
+
+// GetScriptArgv returns the script_argv field as a Go string, trimming
+// at the first NUL byte. Initially populated with raw argv[1] from eBPF;
+// the engine may overwrite this with the resolved script path (via procfs
+// fallback) when argv[1] is a flag rather than a file path.
+func (e *ZaskEvent) GetScriptArgv() string {
+	return nullTerminatedInt8ToString(e.ScriptArgv[:])
+}
+
+// nullTerminatedInt8ToString converts a NUL-terminated int8 slice (C char
+// array) into a Go string.
+func nullTerminatedInt8ToString(data []int8) string {
+	n := len(data)
+	for i, b := range data {
 		if b == 0 {
 			n = i
 			break
 		}
 	}
-	// Convert from int8 (C char) to byte slice.
 	buf := make([]byte, n)
 	for i := 0; i < n; i++ {
-		buf[i] = byte(e.Argv[i])
+		buf[i] = byte(data[i])
 	}
 	return string(buf)
 }

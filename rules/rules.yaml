@@ -6,37 +6,74 @@
 # Rule format:
 #   - name: Human-readable rule name
 #     description: What this rule detects
-#     pattern: Regex pattern matched against the full command line (argv)
-#     action: BLOCK | ALERT
+#     condition: CEL expression evaluated against event attributes
+#     action: BLOCK | ALLOW | ALERT
 #     severity: critical | high | medium | low
+#
+# CEL variables available:
+#   argv        — binary path (string)
+#   script_path — resolved script path when interpreter detected (eBPF + procfs) (string)
+#   pid         — process ID (int)
+#   ppid        — parent process ID (int)
+#   uid         — user ID (int)
+#   cgroup_id   — cgroup ID (int)
+#   inode       — binary inode number (int)
 
 rules:
   - name: reverse-shell-netcat
     description: "Detects netcat-based reverse shells"
-    pattern: 'nc\s+.*-e\s+/bin/(sh|bash)'
+    condition: 'argv.contains("nc") && argv.contains("-e") && (argv.contains("/bin/sh") || argv.contains("/bin/bash"))'
     action: BLOCK
     severity: critical
 
   - name: reverse-shell-bash-tcp
     description: "Detects bash /dev/tcp reverse shells"
-    pattern: '/dev/tcp/\d+\.\d+\.\d+\.\d+/\d+'
+    condition: 'argv.contains("/dev/tcp/")'
     action: BLOCK
     severity: critical
 
   - name: reverse-shell-python
     description: "Detects Python-based reverse shells using socket+pty"
-    pattern: 'python[23]?\s+.*import\s+(socket|pty|subprocess).*connect'
+    condition: 'argv.contains("python") && (argv.contains("import socket") || argv.contains("import pty")) && argv.contains("connect")'
     action: BLOCK
     severity: critical
 
   - name: base64-decode-exec
     description: "Detects base64-decoded command execution"
-    pattern: 'base64\s+(-d|--decode)\s*\|.*sh'
+    condition: 'argv.contains("base64") && (argv.contains("-d") || argv.contains("--decode")) && argv.contains("sh")'
     action: ALERT
     severity: high
 
   - name: curl-pipe-shell
     description: "Detects curl/wget piped to shell"
-    pattern: '(curl|wget)\s+.*\|\s*(ba)?sh'
+    condition: '(argv.contains("curl") || argv.contains("wget")) && argv.contains("|") && (argv.contains("sh") || argv.contains("bash"))'
     action: ALERT
     severity: high
+
+  - name: tmp-script-execution
+    description: "Blocks scripts executed from /tmp by root"
+    condition: 'script_path.startsWith("/tmp/") && uid == 0'
+    action: BLOCK
+    severity: high
+
+  # ── Explicit ALLOW Rules ───────────────────────────────────────────────
+  #
+  # ALLOW rules whitelist binaries at Tier 2: once matched, the inode is
+  # added to the Tier 1 cache and the event skips Tier 3 AI analysis.
+  # This dramatically reduces noise from trusted system binaries.
+  #
+  # IMPORTANT: Rule ordering matters — first match wins. Place all BLOCK
+  # rules BEFORE ALLOW rules so that specific threats are caught before
+  # the broad ALLOW catchall.
+
+  - name: allow-container-runtime
+    description: "Explicitly allow the container runtime (containerd)"
+    condition: 'argv == "/usr/bin/containerd"'
+    action: ALLOW
+    severity: low
+
+  - name: allow-system-bins
+    description: "Allow standard system binaries (reduces Tier 3 noise)"
+    condition: 'argv.startsWith("/usr/bin/") || argv.startsWith("/usr/sbin/") || argv.startsWith("/bin/") || argv.startsWith("/sbin/") || argv.startsWith("/usr/lib")'
+    action: ALLOW
+    severity: low
