@@ -57,11 +57,25 @@ type Logging struct {
 
 // AI configures the Tier 3 AI provider integration.
 type AI struct {
-	ProviderURL   string        `yaml:"providerUrl"`
-	Model         string        `yaml:"model"`
-	APIKeyFile    string        `yaml:"apiKeyFile"`
-	RiskThreshold float64       `yaml:"riskThreshold"`
-	Timeout       time.Duration `yaml:"timeout"`
+	ProviderURL    string         `yaml:"providerUrl"`
+	Model          string         `yaml:"model"`
+	APIKeyEnv      string         `yaml:"apiKeyEnv"`
+	APIKeyFile     string         `yaml:"apiKeyFile"`
+	SystemPrompt   string         `yaml:"systemPrompt"`
+	CircuitBreaker CircuitBreaker `yaml:"circuitBreaker"`
+	Timeout        time.Duration  `yaml:"timeout"`
+	RiskThreshold  float64        `yaml:"riskThreshold"`
+	MaxRetries     int            `yaml:"maxRetries"`
+	Workers        int            `yaml:"workers"`
+	QueueSize      int            `yaml:"queueSize"`
+	FailOpen       bool           `yaml:"failOpen"`
+}
+
+// CircuitBreaker configures the circuit breaker for the AI provider.
+type CircuitBreaker struct {
+	MaxFailures     int           `yaml:"maxFailures"`
+	CooldownTime    time.Duration `yaml:"cooldownTime"`
+	HalfOpenMaxReqs int           `yaml:"halfOpenMaxReqs"`
 }
 
 // Health configures the HTTP health endpoint.
@@ -124,6 +138,15 @@ func DefaultConfig() Config {
 			AI: AI{
 				RiskThreshold: 0.8,
 				Timeout:       5 * time.Second,
+				MaxRetries:    3,
+				Workers:       4,
+				QueueSize:     256,
+				FailOpen:      true,
+				CircuitBreaker: CircuitBreaker{
+					MaxFailures:     5,
+					CooldownTime:    30 * time.Second,
+					HalfOpenMaxReqs: 1,
+				},
 			},
 			Health: Health{
 				ListenAddress: ":7453",

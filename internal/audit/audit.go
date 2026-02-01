@@ -33,8 +33,10 @@ type AuditEvent struct {
 	RuleName   string    `json:"rule_name,omitempty"  parquet:"rule_name,optional"`
 	Mode       string    `json:"mode"       parquet:"mode"`
 	Reasoning  string    `json:"reasoning,omitempty"  parquet:"reasoning,optional"`
+	AIModel    string    `json:"ai_model,omitempty"   parquet:"ai_model,optional"`
 	Inode      uint64    `json:"inode"      parquet:"inode"`
 	CgroupID   uint64    `json:"cgroup_id"  parquet:"cgroup_id"`
+	AIRisk     float64   `json:"ai_risk,omitempty"    parquet:"ai_risk,optional"`
 	Pid        uint32    `json:"pid"        parquet:"pid"`
 	Ppid       uint32    `json:"ppid"       parquet:"ppid"`
 	Uid        uint32    `json:"uid"        parquet:"uid"`

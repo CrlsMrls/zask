@@ -8,6 +8,7 @@ require (
 	github.com/google/cel-go v0.27.0
 	github.com/parquet-go/parquet-go v0.28.0
 	github.com/rs/zerolog v1.34.0
+	github.com/sony/gobreaker/v2 v2.4.0
 	golang.org/x/time v0.14.0
 	gopkg.in/yaml.v3 v3.0.1
 )
