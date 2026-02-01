@@ -4,7 +4,7 @@ Autonomous Linux Kernel Hardening via eBPF LSM and AI.
 
 **ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that evaluates the behavioral intent of Linux processes using raw eBPF LSM telemetry, a deterministic engine, and a tiered AI cascade.
 
-Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level  security enforcement be made semantic? This is that attempt. Inspired by Kahneman's *Thinking, Fast and Slow*: a fast local ML classifier for clear-cut cases, and a generative LLM for deep semantic reasoning on ambiguous ones.
+Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level  security enforcement be made semantic? This is that attempt. 
 
 > ⚠️ ZASK is still experimental, not yet a production-ready EDR. The ONNX tier 
 > is planned but not yet implemented. Feedback on the architecture, threat model, 
