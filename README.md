@@ -2,9 +2,12 @@
 
 Autonomous Linux Kernel Hardening via eBPF LSM and AI.
 
-> ⚠️ ZASK is still on experimentation — the current focus is validating the architecture and the LLM-as-a-judge approach on real kernel telemetry. The ONNX tier is planned but not yet implemented. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
+Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK takes a different approach: it asks *what is this process trying to do?*.
 
-**ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that implements a **Composite AI** architecture to evaluate the semantic intent of Linux processes. By bridging the gap between raw eBPF LSM telemetry and a bimodal AI cascade (Embedded ML + Generative AI), ZASK identifies obfuscated threats—like reverse shells, living-off-the-land (LotL) attacks, and fileless malware—and pushes deterministic verdicts back into the kernel to block malicious behavior.
+**ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that implements a **Composite AI** architecture to evaluate the semantic intent of Linux processes. Inspired by Kahneman's *Thinking, Fast and Slow*, ZASK bridges raw eBPF LSM telemetry and a bimodal AI  cascade — a fast local classifier for clear-cut cases, and a generative LLM for deep semantic  reasoning on ambiguous ones. The result: deterministic verdicts pushed back into the kernel to block attacks, including threats no signature has ever configured.
+
+
+> ⚠️ ZASK is still on experimentation, not a production-ready EDR — the current focus is validating the architecture and the prove that semantic, AI-powered kernel enforcement is feasible — and to understand where it  breaks. The ONNX tier is planned but not yet implemented. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
 
 ## How It Works
 
@@ -47,6 +50,8 @@ Every process execution is evaluated and assigned one of four verdicts:
 | `AI_QUEUE` | No Tier 2 rule matched; event is routed to Tier 3 (LLM) for semantic analysis. Execution proceeds until a verdict is returned, becoming a retrospective action. |
 
 When the AI loop returns a risk score above the configured threshold, the original process is killed with `SIGKILL` and the inode is blocked in the kernel. Future executions of the same binary will be blocked immediately by the eBPF hook without hitting user-space at all.
+
+`AI_QUEUE` is the most deliberate tradeoff in ZASK's architecture. Execution proceeds while the LLM deliberates, making enforcement retrospective rather than preventive for novel threats. This is an intentional choice — blocking everything awaiting AI judgment would make the system unusable. The proposed ONNX tier should mitigate this, but requires training on common patterns / attacks to be effective.
 
 ### CEL Policy Rules
 
@@ -119,5 +124,4 @@ ZASK interacts directly with the Linux kernel via eBPF LSM hooks. A bug or misco
 - [Configuration Reference](docs/configuration.md)
 - [Kernel Requirements](docs/kernel-requirements.md)
 - [local VM Development Guide](docs/lima-dev-guide.md)
-
 
