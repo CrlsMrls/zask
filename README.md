@@ -2,21 +2,22 @@
 
 Autonomous Linux Kernel Hardening via eBPF LSM and AI.
 
-Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK takes a different approach: it asks *what is this process trying to do?*.
+**ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that evaluates the behavioral intent of Linux processes using raw eBPF LSM telemetry, a deterministic engine, and a tiered AI cascade.
 
-**ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that implements a **Composite AI** architecture to evaluate the semantic intent of Linux processes. Inspired by Kahneman's *Thinking, Fast and Slow*, ZASK bridges raw eBPF LSM telemetry and a bimodal AI  cascade — a fast local classifier for clear-cut cases, and a generative LLM for deep semantic  reasoning on ambiguous ones. The result: deterministic verdicts pushed back into the kernel to block attacks, including threats no signature has ever configured.
+Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level  security enforcement be made semantic? This is that attempt. Inspired by Kahneman's *Thinking, Fast and Slow*: a fast local ML classifier for clear-cut cases, and a generative LLM for deep semantic reasoning on ambiguous ones.
 
-
-> ⚠️ ZASK is still on experimentation, not a production-ready EDR — the current focus is validating the architecture and the prove that semantic, AI-powered kernel enforcement is feasible — and to understand where it  breaks. The ONNX tier is planned but not yet implemented. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
+> ⚠️ ZASK is still experimental, not yet a production-ready EDR. The ONNX tier 
+> is planned but not yet implemented. Feedback on the architecture, threat model, 
+> or approach is very welcome — open an issue or reach out directly.
 
 ## How It Works
 
 | Tier | Layer | Mechanism | Latency | Purpose |
 |------|-------|-----------|---------|---------|
 | **1** | Kernel | eBPF LSM + Inode Map | < 1μs | Instant blocking based on known bad inodes |
-| **2** | User-space | Deterministic Engine | < 10ms | CEL policy matching |
-| **3** | User-space | ONNX Fast Classifier | < 50ms | Local model triage to reduce LLM calls |
-| **4** | User-space/remote | LLM Semantic Loop | 1–5s | AI analysis of process intent and judge |
+| **2** | User-space | Deterministic Engine | < 10ms | Common Expression Language (CEL) policy matching |
+| **3** | User-space | Fast Classifier | < 50ms | Local ONNX machine learning model triage |
+| **4** | User-space/remote | LLM Semantic Judge | 5-10s | Gen AI reasoning on process intent for ambiguous cases |
 
 
 ZASK operates a multi-tiered enforcement model inspired by Daniel Kahneman's Thinking, *Fast and Slow*, System 1 (fast, intuitive) and System 2 (slow, deliberative, logical). 
