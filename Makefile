@@ -47,6 +47,48 @@ test:
 lint:
 	$(LINT) run ./...
 
+# Lima VM name
+LIMA_VM  := zask
+# Writable build directory inside the VM (host mount is read-only)
+VM_BUILD := /tmp/zask-build
+# Shared writable mount between host and VM
+LIMA_SHARED := /tmp/lima
+
+## vm-build: (macOS only) Copy project to the Lima VM, run generate + build,
+##   and sync generated files back to the host.
+vm-build:
+	@echo "==> Copying project to VM..." && \
+	limactl shell $(LIMA_VM) -- bash -c '\
+		set -e && \
+		rm -rf $(VM_BUILD) && \
+		cp -a /Users/$$(whoami)/src/zask $(VM_BUILD) && \
+		cd $(VM_BUILD) && \
+		echo "==> Running make generate..." && \
+		make generate && \
+		echo "==> Running make build..." && \
+		make build && \
+		echo "==> Copying generated files to shared mount..." && \
+		cp internal/ebpf/zask_bpfel.go $(LIMA_SHARED)/ && \
+		cp internal/ebpf/zask_bpfel.o $(LIMA_SHARED)/ && \
+		cp $(BINARY) $(LIMA_SHARED)/ && \
+		echo "==> VM build complete."' && \
+	cp $(LIMA_SHARED)/zask_bpfel.go internal/ebpf/zask_bpfel.go && \
+	cp $(LIMA_SHARED)/zask_bpfel.o internal/ebpf/zask_bpfel.o && \
+	echo "==> Generated files synced to host."
+
+## vm-test: (macOS only) Run the Phase 1 kernel-level test suite in the Lima VM.
+vm-test:
+	@limactl shell $(LIMA_VM) -- bash -c '\
+		set -e && \
+		cd $(VM_BUILD) && \
+		sudo bash scripts/test-phase1.sh'
+
+## vm-run: (macOS only) Run zaskd in the Lima VM (requires vm-build first).
+vm-run:
+	@limactl shell $(LIMA_VM) -- bash -c '\
+		cd $(VM_BUILD) && \
+		sudo ./$(BINARY)'
+
 ## clean: Remove build artifacts and generated files.
 clean:
 	rm -f $(BINARY)

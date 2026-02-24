@@ -2,16 +2,17 @@
 /*
  * vmlinux.h — Minimal kernel type definitions for ZASK eBPF programs.
  *
- * This is a minimal vmlinux.h containing only the types needed for the
- * current eBPF programs. For Phase 1+, regenerate the full vmlinux.h from
- * a running kernel with BTF support:
+ * This is a hand-maintained subset of the kernel's vmlinux.h containing
+ * only the types and fields accessed by ZASK eBPF programs. Adding a field
+ * here is safe — CO-RE relocations ensure the loader resolves actual
+ * offsets from the running kernel's BTF at load time.
+ *
+ * To regenerate the complete vmlinux.h from the running kernel:
  *
  *   bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
  *
- * CO-RE (Compile Once – Run Everywhere) uses these type definitions at
- * compile time to generate relocation records. The kernel's BTF at load
- * time provides the actual field offsets, so a single vmlinux.h works
- * across kernel versions.
+ * The minimal approach is preferred for readability and maintainability.
+ * Only add types/fields that are directly accessed via BPF_CORE_READ().
  */
 
 #ifndef __VMLINUX_H__
@@ -49,12 +50,18 @@ typedef __u64 __be64;
 typedef __u32 __wsum;
 
 /*
- * Filesystem types used for inode-based identification
+ * Filesystem types used for inode-based identification.
+ * Fields accessed: inode->i_ino, inode->i_sb->s_dev.
  */
+struct super_block
+{
+  unsigned int s_dev; /* dev_t — encodes major/minor device number */
+};
+
 struct inode
 {
   unsigned long i_ino;
-  /* dev_t i_rdev is not directly accessible; use CO-RE helpers */
+  struct super_block *i_sb;
 };
 
 struct file
@@ -92,6 +99,7 @@ struct task_struct
   int tgid;
   unsigned int flags;
   struct task_struct *parent;
+  struct task_struct *real_parent; /* biological parent (not changed by ptrace) */
   const struct cred *real_cred;
   char comm[16];
 };
@@ -121,8 +129,14 @@ enum bpf_map_type
 {
   BPF_MAP_TYPE_HASH = 1,
   BPF_MAP_TYPE_ARRAY = 2,
+  BPF_MAP_TYPE_PERCPU_ARRAY = 6,
   BPF_MAP_TYPE_PERF_EVENT_ARRAY = 4,
   BPF_MAP_TYPE_RINGBUF = 27,
 };
+
+/*
+ * Errno constants returned by LSM hooks.
+ */
+#define EPERM 1
 
 #endif /* __VMLINUX_H__ */

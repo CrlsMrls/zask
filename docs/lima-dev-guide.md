@@ -126,19 +126,48 @@ limactl cp -r zask:/tmp/zask/ /Users/carlos/src/zask/
 
 Be careful with this command as it will overwrite files on your Mac with the contents from the VM. Always ensure you have a backup or use version control to prevent data loss.
 
-## Building ZASK
+## Daily Development Workflow on macOS + Lima VM
 
-Inside the VM:
+eBPF development requires splitting work between macOS (editing, linting) and the Linux VM (compiling eBPF, running the daemon). The Makefile automates this.
 
 ```bash
-# Generate vmlinux.h (if not already present)
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+# 1. Edit code on macOS in your editor
 
-# Generate eBPF Go bindings
-make generate
+# 2. Compile eBPF and build in the VM (copies project, generates, builds, syncs back)
+make vm-build
 
-# Build the daemon
-make build
+# 3. Lint and test on macOS (uses the synced generated files)
+make lint && make test
+
+# 4. Run the daemon in the VM for kernel-level testing
+make vm-run
+
+# 5. In a separate terminal, run kernel-level tests
+make vm-test
+```
+
+`make vm-build` handles the entire copy → generate → build → sync-back cycle automatically. You never need to manually SSH into the VM or copy files around.
+
+### What Runs Where and Why
+
+- **`make generate`** needs Linux clang with BPF target — must run in the VM
+- **`make build`** works on both, but the VM produces the Linux binary you run with `sudo`
+- **`make lint`** is pure Go source analysis — runs on macOS where `golangci-lint` is installed
+- **`make test`** runs Go unit tests — works on macOS with the synced generated files
+- **`sudo ./zaskd`** loads eBPF programs into the Linux kernel — VM only
+
+### Manual VM Build (alternative)
+
+If you prefer to work interactively inside the VM:
+
+```bash
+limactl shell zask
+
+# Inside the VM
+cp -r /Users/$(whoami)/src/zask /tmp/zask-build
+cd /tmp/zask-build
+make generate && make build
+sudo ./zaskd
 ```
 
 
