@@ -4,11 +4,7 @@ Autonomous Linux Kernel Hardening via eBPF LSM and AI.
 
 **ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that evaluates the behavioral intent of Linux processes using raw eBPF LSM telemetry, a deterministic engine, and a tiered AI cascade.
 
-Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level  security enforcement be made semantic? This is that attempt. 
-
-> ⚠️ ZASK is still experimental, not yet a production-ready EDR. The ONNX tier 
-> is planned but not yet implemented. Feedback on the architecture, threat model, 
-> or approach is very welcome — open an issue or reach out directly.
+Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level security enforcement be made semantic? This is that attempt. 
 
 ## How It Works
 
@@ -20,13 +16,17 @@ Most security tools detect threats syntactically — matching signatures, hashes
 | **4** | User-space/remote | LLM Semantic Judge | 5-10s | Gen AI reasoning on process intent for ambiguous cases |
 
 
+> ⚠️ ZASK is still experimental, not yet a production-ready EDR. The ONNX tier 
+> is planned but not yet implemented. Feedback on the architecture, threat model, 
+> or approach is very welcome — open an issue or reach out directly.
+
 ZASK operates a multi-tiered enforcement model inspired by Daniel Kahneman's Thinking, *Fast and Slow*, System 1 (fast, intuitive) and System 2 (slow, deliberative, logical). 
 
 - **1. The Kernel Telemetry:** The kernel provides the raw behavioral facts (syscall sequences, inodes, arguments) through eBPF LSM hooks.
-- **2. Deterministic Engine:** A high-performance Go engine evaluates known bad patterns and enforces simple rules with minimal latency.
-- **3. The Fast Path (System 1 - ONNX) [WIP]:** Telemetry is dynamically vectorized and evaluated by an embedded, ultra-fast ONNX Machine Learning model. Clear threats or definitively benign processes are handled deterministically in milliseconds. ⚠️ Work in progress 
-- **4. The Deep Arbiter (System 2 - LLM):** When Tier 2 detects a severe anomaly, or the ONNX model confidence falls into the "gray zone," ZASK seamlessly escalates the case to the LLM-as-a-Judge. The LLM performs deep semantic reasoning on the exploit pattern to issue a final Enforcement Verdict (Block vs. Allow).
-- **5. The Alerting:** Asynchronously, the LLM backend can generate rich, human-readable forensic incident reports explaining *why* a process was blocked, eliminating the "black box" problem of traditional ML.
+- **2. Deterministic Engine:** A Go engine evaluates known bad patterns and enforces simple rules with minimal latency. When a process matches a known bad inode or a CEL policy rule, it is blocked immediately without further analysis. If no deterministic rule matches, the event can be escalated to the AI tiers.
+- **3. The Fast Path (System 1 - ONNX) [WIP]:** Telemetry is evaluated by an embedded, ultra-fast ONNX Machine Learning model. Clear threats are handled in milliseconds. ⚠️ Work in progress 
+- **4. The Deep Arbiter (System 2 - LLM):** When the ONNX model confidence falls into the "gray zone," ZASK seamlessly escalates the case to the LLM-as-a-Judge. The LLM performs semantic reasoning on the exploit pattern to issue a final verdict (Block vs. Allow).
+- **5. The Alerting:** Asynchronously, ZASK can be configured to emit events for all executions, regardless of verdict, to a variety of outputs (JSON, Parquet, text) for security information and event management (SIEM).
 
 For more details on the architecture, see the [Architecture Overview](docs/architecture.md).
 
@@ -48,7 +48,7 @@ Every process execution is evaluated and assigned one of four verdicts:
 | `ALLOW` | Execution permitted. If produced by an explicit rule, the inode is cached in Tier 1 to fast-path all future executions of that binary — bypassing Tier 2 rules and suppressing Tier 3 AI analysis entirely. |
 | `BLOCK` | Process is killed immediately (`SIGKILL`) and the inode is written to the kernel verdict map, blocking all future executions at the kernel level (< 1μs). |
 | `ALERT` | Suspicious activity logged but execution is not blocked — useful for high-noise rules that need visibility without enforcement. |
-| `AI_QUEUE` | No Tier 2 rule matched; event is routed to Tier 3 (LLM) for semantic analysis. Execution proceeds until a verdict is returned, becoming a retrospective action. |
+| `AI_QUEUE` | No Tier 2 rule matched; event is routed to higher tiers for semantic analysis. Execution proceeds until a verdict is returned, becoming a retrospective action. |
 
 When the AI loop returns a risk score above the configured threshold, the original process is killed with `SIGKILL` and the inode is blocked in the kernel. Future executions of the same binary will be blocked immediately by the eBPF hook without hitting user-space at all.
 
@@ -111,6 +111,13 @@ Parent: nginx
 Parent Command: /usr/sbin/nginx -g daemon off;
 Service: /system.slice/nginx.service
 ```
+
+### Cloud-native by design
+
+ZASK is built to feel immediately familiar to anyone who operates Kubernetes clusters. Configuration is driven entirely by a YAML file (hot-reloaded on change), which can be served to the daemon via a `ConfigMap` and credentials in a `Secret`. The daemon exposes standard Kubernetes probe endpoints — `GET /healthz` (liveness) and `GET /readyz` (readiness, gated on eBPF load and ring buffer active) — so a DaemonSet can manage rollout and traffic routing exactly like any other workload. A Prometheus `/metrics` endpoint exposes queue depth, circuit breaker state, AI verdict counts, and ring buffer drop counters for standard scraping via a `ServiceMonitor`.
+
+Operationally, ZASK runs as a **DaemonSet** — one pod per node — relying on the fact that all containers on a node share the host kernel. The intention is to export the logging into a cluster-wide logging pipeline (e.g., Fluent Bit) rather than building a custom alerting or SIEM (Security Information and Event Management) integration.
+
 
 ## Development
 
