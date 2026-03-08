@@ -345,4 +345,4 @@ CEL (Common Expression Language) rules evaluate against structured event attribu
 
 ## Environment
 
-Configuration is loaded exclusively from the YAML file. Environment variable overrides are reserved for future implementation (Phase 5).
+Configuration is loaded exclusively from the YAML file. Environment variable overrides are reserved for future implementation.

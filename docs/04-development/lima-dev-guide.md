@@ -121,7 +121,7 @@ Since the mounted macOS directory is read-only inside the VM, you cannot copy fi
 
 ```bash
 # Copy files from the VM back to your Mac
-limactl cp -r zask:/tmp/zask/ /Users/carlos/src/zask/
+limactl cp -r zask:/tmp/zask/ $(pwd)
 ```
 
 Be careful with this command as it will overwrite files on your Mac with the contents from the VM. Always ensure you have a backup or use version control to prevent data loss.
