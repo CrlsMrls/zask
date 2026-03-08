@@ -8,10 +8,6 @@ Most security tools detect threats syntactically — matching signatures, hashes
 
 > ⚠️ ZASK is still experimental, not yet a production-ready EDR. The ONNX tier is planned but not yet implemented. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
 
-## Tech Stack
-
-`Go` · `C` · `eBPF/CO-RE` · `cilium/ebpf` · `CEL` ·
-
 ## Quick Links
 
 - **[Setup & Installation](./docs/01-setup/README.md)**
@@ -21,14 +17,8 @@ Most security tools detect threats syntactically — matching signatures, hashes
 
 ## How It Works
 
-| Tier | Layer | Mechanism | Latency | Purpose |
-|------|-------|-----------|---------|---------|
-| **1** | Kernel | eBPF LSM + Inode Map | < 1μs | Instant blocking based on known bad inodes |
-| **2** | User-space | Deterministic Engine | < 10ms | Common Expression Language (CEL) policy matching |
-| **3** | User-space | Fast Classifier | < 50ms | Local ONNX machine learning model triage |
-| **4** | User-space/remote | LLM Semantic Judge | 5-10s | Gen AI reasoning on process intent for ambiguous cases |
+Simplified overview:
 
-This is a simplified overview of the architecture:
 ```mermaid
 flowchart LR
     subgraph Kernel["Kernel Space"]
@@ -37,9 +27,8 @@ flowchart LR
         vmap -- "ALLOW" --> ok["0 (exec)"]
         vmap -- "MISS" --> rb[(Ring Buffer)]
     end
-    rb ==> engine
-    subgraph User["User Space"]
-        engine["Go Engine"] --> T2["Deterministic Rules"]
+    rb ==> T2["Configured Rules"]
+    subgraph User["User Space / Go Engine"]
         T2 -- "ALLOW" --> audit
         T2 -->|miss| T3["AI"]
         T2 -- "BLOCK" --> enforce["SIGKILL + Map"]
@@ -49,13 +38,20 @@ flowchart LR
     enforce --> audit[/"Audit"/]
 ```
 
-ZASK operates a multi-tiered enforcement model inspired by Daniel Kahneman's Thinking, *Fast and Slow*, System 1 (fast, intuitive) and System 2 (slow, deliberative, logical). 
+ZASK operates a multi-tiered enforcement model inspired by [Daniel Kahneman's Thinking, *Fast and Slow*](https://en.wikipedia.org/wiki/Thinking,_Fast_and_Slow), System 1 (fast, intuitive) and System 2 (slow, deliberative, logical). 
 
-- **1. The Kernel Telemetry:** The kernel provides the raw behavioral facts (syscall sequences, inodes, arguments) through eBPF LSM hooks.
-- **2. Deterministic Engine:** A Go engine evaluates known bad patterns and enforces simple rules with minimal latency. When a process matches a known bad inode or a CEL policy rule, it is blocked immediately without further analysis. If no deterministic rule matches, the event can be escalated to the AI tiers.
-- **3. The Fast Path (System 1 - ONNX) [planned]:** Telemetry is evaluated by an embedded, ultra-fast ONNX Machine Learning model. Clear threats are handled in milliseconds.
-- **4. The Deep Arbiter (System 2 - LLM):** When the ONNX model confidence falls into the "gray zone," ZASK seamlessly escalates the case to the LLM-as-a-Judge. The LLM performs semantic reasoning on the exploit pattern to issue a final verdict (Block vs. Allow).
+- **1. LSM Hooks:** The kernel provides the raw behavioral facts (syscall sequences, inodes, arguments) through eBPF LSM hooks.
+- **2. Configured Rules:** A Go engine evaluates known bad patterns and enforces simple rules with minimal latency. When a process matches a determinisitc policy rule, described using `Common Expression Language (CEL)`, it is blocked/allowed immediately without further analysis. If no matches, the event can be escalated to the AI tiers.
+- **3. The Fast Path (System 1 - ONNX) [planned]:** Event is evaluated by an embedded, ultra-fast ONNX-based Machine Learning model. Clear threats are handled in milliseconds.
+- **4. The Deep Arbiter (System 2 - LLM):** When the the fast model confidence falls into the "gray zone," ZASK escalates the case to the LLM. The LLM acts as a judge and performs semantic reasoning to issue a final verdict (Block vs. Allow).
 - **5. The Alerting:** Asynchronously, ZASK can be configured to emit events for all executions, regardless of verdict, to a variety of outputs (JSON, Parquet, text) for security information and event management (SIEM).
+
+| Tier | Layer | Mechanism | Latency | Purpose |
+|------|-------|-----------|---------|---------|
+| **1** | Kernel | eBPF LSM + Inode Map | < 1μs | Instant blocking based on known bad inodes |
+| **2** | User-space | Configured Rules | < 10ms | CEL policy matching |
+| **3** | User-space | Fast Classifier | < 50ms | Local ONNX machine learning model triage |
+| **4** | User-space/remote | LLM Semantic Judge | 5-10s | Gen AI reasoning on process intent for ambiguous cases |
 
 
 ## Core Capabilities
@@ -71,7 +67,7 @@ This technique allows ZASK to work across all Linux distributions, as long as th
 
 ### AI-Powered Triage
 
-The unique value proposition of ZASK is the integration of AI into the kernel-level security stack. By escalating ambiguous cases to an LLM, ZASK can potentially identify novel attack patterns that deterministic rules would miss. For example, while a standard rule engine might miss a heavily obfuscated base64 payload piped into bash, the LLM tier can decode and semantically understand the script's intent.
+The unique value proposition of ZASK is the integration of AI into the kernel-level security stack. By escalating ambiguous cases to an LLM, ZASK can potentially identify novel attack patterns that deterministic rules would miss. For example, while a standard rule engine might miss a heavily obfuscated base64 payload piped into bash, or a webserver running a shell, the LLM tier can decode and semantically understand the intent.
 
 The events sent to the LLM include comprehensive context for analysis:
 
@@ -111,7 +107,7 @@ Rules are aware of script interpreters (configurable list), a common evasion tec
 
 ### AI Resilience & Fail-Safe Defaults
 
-ZASK treats AI availability as an operational concern, not a hard dependency. If the AI provider is slow, unreachable, or overwhelmed:
+ZASK treats AI availability as an operational concern, not a hard dependency. If the LLM provider is slow, unreachable, or overwhelmed these patterns ensure the daemon remains operational:
 
 - **Circuit breaker** — automatically opens after repeated failures, preventing request pile-ups. Transitions through half-open probing back to closed when the provider recovers. ZASK uses the [sony/gobreaker](https://github.com/sony/gobreaker/) library for this pattern.
 - **Fail-open default** — when the circuit is open, the AI queue is full, or the per-second rate limit is exceeded, events default to `ALLOW` with a logged warning. Executions are never silently dropped and the daemon keeps running normally.
@@ -145,7 +141,9 @@ ZASK deamon has a self-protection mechanism that blocks `SIGKILL` and `SIGTERM` 
 
 > **Warning:** ZASK interacts directly with the Linux kernel via eBPF LSM hooks. A bug or misconfiguration could cause serious system instability. For development, the recommended approach is to use a dedicated Linux VM. 
 
-The maintainer development environment is macOS + [Lima based](https://lima-vm.io/) VM. Compiling target and running the deamon must be done inside Linux. All `vm-*` targets use `limactl shell` locally and are run from the macOS host. 
+The maintainer development environment is macOS + [Lima based](https://lima-vm.io/) VM. Compiling and running the deamon must be done inside Linux. All `vm-*` targets use `limactl shell` (from the macOS host). 
+
+This is a short summary of the most common commands:
 
 | Command | Where | What |
 |---------|-------|------|

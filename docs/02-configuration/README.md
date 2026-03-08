@@ -8,6 +8,8 @@ The principles of the configuration is to be **declarative, self-contained, and 
 
 Currently, only a few environment variables are supported, to allow storing sensitive information (like API keys) outside of the config file. 
 
+## Overview
+
 The configuration file is organized into the following logical sections:
 
 - **General settings** monitoring mode, self-protection mechanism
@@ -107,3 +109,12 @@ This is very convenient for Kubernetes deployments, a DaemonSet can manage rollo
 
 **TODO:** Currently, this is configured under two seeparate sections, but the goal is to unify them under a single `observability` section with two subsections.
 
+
+## What's next
+
+| Document | Description |
+|---|---|
+| [rules-examples.md](rules-examples.md) | Verified CEL rule patterns for blocking, alerting, and allowlisting. |
+| [e2e-examples.md](e2e-examples.md) | Verified, ready-to-use configurations for dev/test and production scenarios. |
+| [ai-integration.md](ai-integration.md) | AI provider setup, prompt engineering, circuit breaker, and feedback loop. |
+| [configuration.md](configuration.md) | Full configuration reference — every field, type, default, and validation rule. |
