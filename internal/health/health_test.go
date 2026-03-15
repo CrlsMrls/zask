@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +16,7 @@ func TestHealthz_ReturnsOK(t *testing.T) {
 	srv.SetEBPFReady(true)
 	srv.SetRingBufReady(true)
 
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	srv.handleHealthz(w, req)
 
@@ -40,7 +41,7 @@ func TestReadyz_NotReadyWithoutEBPF(t *testing.T) {
 	srv := NewServer(":0", log)
 	// Neither eBPF nor ringbuf is ready.
 
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
 	w := httptest.NewRecorder()
 	srv.handleReadyz(w, req)
 
@@ -63,7 +64,7 @@ func TestReadyz_ReadyWithBothComponents(t *testing.T) {
 	srv.SetEBPFReady(true)
 	srv.SetRingBufReady(true)
 
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
 	w := httptest.NewRecorder()
 	srv.handleReadyz(w, req)
 

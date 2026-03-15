@@ -1,51 +1,56 @@
-# golangci-lint configuration for ZASK
-# https://golangci-lint.run/usage/configuration/
-
+version: "2"
 run:
-  timeout: 5m
   modules-download-mode: readonly
-
 linters:
   enable:
-    - errcheck
-    - govet
-    - staticcheck
-    - unused
-    - gosimple
-    - ineffassign
-    - typecheck
+    - bodyclose
+    - errorlint
+    - goconst
+    - misspell
+    - noctx
+    - unconvert
+  settings:
+    errcheck:
+      check-type-assertions: true
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    govet:
+      enable-all: true
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errorlint
+        path: _test\.go
+      - linters:
+          - errcheck
+          - govet
+          - staticcheck
+        path: zask_bpf.*\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
     - gofmt
     - goimports
-    - misspell
-    - unconvert
-    - goconst
-    - errorlint
-    - bodyclose
-    - noctx
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-  govet:
-    enable-all: true
-  errorlint:
-    errorf: true
-    asserts: true
-    comparison: true
-  goimports:
-    local-prefixes: github.com/CrlsMrls/zask
-  misspell:
-    locale: US
-
-issues:
-  exclude-rules:
-    # Allow fmt.Errorf without wrapping in test files
-    - path: _test\.go
-      linters:
-        - errorlint
-    # Don't check generated files
-    - path: zask_bpf.*\.go
-      linters:
-        - errcheck
-        - govet
-        - staticcheck
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/CrlsMrls/zask
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -67,7 +67,8 @@ func (s *Server) SetRingBufReady(ready bool) {
 
 // Start begins serving health endpoints. Blocks until the server stops.
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.server.Addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", s.server.Addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.server.Addr, err)
 	}
