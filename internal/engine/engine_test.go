@@ -548,6 +548,161 @@ rules:
 	}
 }
 
+// =========================================================================
+// Phase 3b: Kernel fast-path promotion tests
+// =========================================================================
+
+// mockLoader records calls to AllowInode and BlockInode for unit testing.
+type mockLoader struct {
+	allowed []zaskebpf.ZaskInodeKey
+	blocked []zaskebpf.ZaskInodeKey
+}
+
+func (m *mockLoader) AllowInode(key zaskebpf.ZaskInodeKey) error {
+	m.allowed = append(m.allowed, key)
+	return nil
+}
+
+func (m *mockLoader) BlockInode(key zaskebpf.ZaskInodeKey) error {
+	m.blocked = append(m.blocked, key)
+	return nil
+}
+
+// TestEngine_AllowInode_OnNullRuleMatch verifies that when an event matches
+// no rule (cache miss, Tier 2 pass-through), the engine calls AllowInode on
+// the loader to promote the inode to the kernel fast-path (T3b.3).
+func TestEngine_AllowInode_OnNullRuleMatch(t *testing.T) {
+	log := zerolog.Nop()
+	ml := &mockLoader{}
+
+	eng, err := New(EngineOptions{
+		RateLimit: 10,
+		RateBurst: 100,
+	}, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer eng.Close()
+	eng.loader = ml
+
+	ev := zaskebpf.ZaskEvent{InodeNumber: 42, DeviceId: 7, Pid: 100}
+	for i := 0; i < len("/usr/bin/ls"); i++ {
+		ev.Argv[i] = int8("/usr/bin/ls"[i])
+	}
+
+	eng.Process(context.Background(), ev)
+
+	if len(ml.allowed) == 0 {
+		t.Fatal("AllowInode was NOT called for a no-rule-match event")
+	}
+	want := zaskebpf.ZaskInodeKey{InodeNumber: 42, DeviceId: 7}
+	if ml.allowed[0] != want {
+		t.Errorf("AllowInode called with key %+v, want %+v", ml.allowed[0], want)
+	}
+	if len(ml.blocked) != 0 {
+		t.Errorf("BlockInode called %d times, want 0", len(ml.blocked))
+	}
+}
+
+// TestEngine_AllowInode_OnAllowRuleMatch verifies that an explicit ALLOW rule
+// triggers AllowInode to promote the binary to the kernel fast-path (T3b.4).
+func TestEngine_AllowInode_OnAllowRuleMatch(t *testing.T) {
+	log := zerolog.Nop()
+	ml := &mockLoader{}
+
+	eng, err := New(EngineOptions{
+		RateLimit: 10,
+		RateBurst: 100,
+	}, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer eng.Close()
+	eng.loader = ml
+
+	allowRule := `
+rules:
+  - name: allow-ls
+    condition: 'argv.contains("/usr/bin/ls")'
+    action: ALLOW
+    severity: low
+`
+	if err := eng.rules.LoadFromBytes([]byte(allowRule)); err != nil {
+		t.Fatalf("LoadFromBytes() error = %v", err)
+	}
+
+	ev := zaskebpf.ZaskEvent{InodeNumber: 99, DeviceId: 3, Pid: 200}
+	for i := 0; i < len("/usr/bin/ls"); i++ {
+		ev.Argv[i] = int8("/usr/bin/ls"[i])
+	}
+
+	verdict := eng.Process(context.Background(), ev)
+
+	if verdict.Action != ActionAllow {
+		t.Errorf("Action = %v, want ActionAllow", verdict.Action)
+	}
+	if len(ml.allowed) == 0 {
+		t.Fatal("AllowInode was NOT called for an ALLOW rule match")
+	}
+	want := zaskebpf.ZaskInodeKey{InodeNumber: 99, DeviceId: 3}
+	if ml.allowed[0] != want {
+		t.Errorf("AllowInode called with key %+v, want %+v", ml.allowed[0], want)
+	}
+	if len(ml.blocked) != 0 {
+		t.Errorf("BlockInode called %d times on ALLOW rule, want 0", len(ml.blocked))
+	}
+}
+
+// TestEngine_NoAllowInode_OnBlockRuleMatch verifies that a BLOCK rule triggers
+// only BlockInode, never AllowInode (T3b.5).
+func TestEngine_NoAllowInode_OnBlockRuleMatch(t *testing.T) {
+	log := zerolog.Nop()
+	ml := &mockLoader{}
+
+	eng, err := New(EngineOptions{
+		RateLimit: 10,
+		RateBurst: 100,
+		Mode:      ModeLockdown,
+	}, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer eng.Close()
+	eng.loader = ml
+
+	blockRule := `
+rules:
+  - name: block-nc
+    condition: 'argv.contains("nc")'
+    action: BLOCK
+    severity: critical
+`
+	if err := eng.rules.LoadFromBytes([]byte(blockRule)); err != nil {
+		t.Fatalf("LoadFromBytes() error = %v", err)
+	}
+
+	ev := zaskebpf.ZaskEvent{InodeNumber: 55, DeviceId: 2, Pid: 99999}
+	for i := 0; i < len("/usr/bin/nc"); i++ {
+		ev.Argv[i] = int8("/usr/bin/nc"[i])
+	}
+
+	verdict := eng.Process(context.Background(), ev)
+
+	if verdict.Action != ActionBlock {
+		t.Errorf("Action = %v, want ActionBlock", verdict.Action)
+	}
+	if len(ml.allowed) != 0 {
+		t.Errorf("AllowInode called %d times on BLOCK rule, want 0", len(ml.allowed))
+	}
+	if len(ml.blocked) == 0 {
+		t.Fatal("BlockInode was NOT called for a BLOCK rule match")
+	}
+	want := zaskebpf.ZaskInodeKey{InodeNumber: 55, DeviceId: 2}
+	if ml.blocked[0] != want {
+		t.Errorf("BlockInode called with key %+v, want %+v", ml.blocked[0], want)
+	}
+}
+
 func TestRuleEngine_OnReloadNotCalledOnError(t *testing.T) {
 	log := zerolog.Nop()
 	re := NewRuleEngine(log)

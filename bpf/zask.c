@@ -136,6 +136,21 @@ struct
   __type(value, __u64);
 } drop_counter SEC(".maps");
 
+// baseline_allow_counter tracks the number of kernel ALLOW fast-path hits
+// per CPU (§3b.1.2). Binaries with a VERDICT_ALLOW entry skip the ring
+// buffer entirely; this counter is the only visibility into that volume.
+// Phase 4 exposes it as the zask_baseline_allow_total Prometheus metric.
+//
+// Key:   __u32 (always 0 — single logical counter)
+// Value: __u64 count of fast-path ALLOW hits
+struct
+{
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+} baseline_allow_counter SEC(".maps");
+
 // ---------------------------------------------------------------------------
 // Programs
 // ---------------------------------------------------------------------------
@@ -179,9 +194,22 @@ int BPF_PROG(zask_bprm_check, struct linux_binprm *bprm)
   {
     is_map_hit = 1;
     verdict = *value;
+    if (verdict == VERDICT_ALLOW)
+    {
+      // Fast-path: known-good binary. Skip the ring buffer entirely —
+      // no userspace involvement needed. Increment the per-CPU counter
+      // so Phase 4 can expose this volume as a Prometheus metric.
+      __u32 idx = 0;
+      __u64 *cnt = bpf_map_lookup_elem(&baseline_allow_counter, &idx);
+      if (cnt)
+        __sync_fetch_and_add(cnt, 1);
+      return 0;
+    }
   }
 
   // --- 3. Telemetry export (§1.4) ---
+  // Reached only for BLOCK hits (is_map_hit=1, verdict=BLOCK) and
+  // unknown binaries (is_map_hit=0). ALLOW fast-path exits above.
 
   // Reserve space directly in the ring buffer to avoid stack allocation
   // of the ~300-byte event struct (BPF stack limit is 512 bytes).

@@ -47,7 +47,7 @@ rules:
 
 ## Allowlisting trusted binaries
 
-ALLOW rules short-circuit Tier 3: once matched, the binary's inode is cached and AI analysis is skipped on every future run. Place these **after** all BLOCK/ALERT rules.
+ALLOW rules short-circuit Tier 3: once matched, the binary's inode is added to the Tier 1 cache, written to the kernel `verdict_map` as `VERDICT_ALLOW`, and AI analysis is skipped on every future run. On the **second and subsequent executions** the eBPF hook handles the binary entirely in-kernel (single map lookup, no ring buffer event, < 1 μs). Place these **after** all BLOCK/ALERT rules.
 
 ```yaml
   # Specific binary by exact path

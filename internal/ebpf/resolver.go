@@ -72,6 +72,56 @@ func findScriptInArgs(args [][]byte) string {
 	return ""
 }
 
+// AllowPath resolves a file path to its inode key and writes an ALLOW
+// entry into the verdict map. Symmetric to BlockPath. After this call,
+// subsequent executions of the binary are handled by the kernel fast-path
+// (no ring buffer event, no userspace processing).
+func (l *Loader) AllowPath(path string) error {
+	key, err := ResolvePathToInode(path)
+	if err != nil {
+		return fmt.Errorf("resolve path %s: %w", path, err)
+	}
+	return l.AllowInode(key)
+}
+
+// AllowInode writes an ALLOW verdict (value=0) into the kernel verdict map
+// for the given inode key. Symmetric to BlockInode. The kernel eBPF hook
+// will fast-path subsequent executions: no ring buffer event is emitted
+// and execution proceeds immediately.
+//
+// Writes are logged at Debug level only — ALLOW writes are high-frequency
+// and logging them at Info would overwhelm the audit log.
+func (l *Loader) AllowInode(key ZaskInodeKey) error {
+	verdict := uint32(0) // VERDICT_ALLOW
+	if err := l.objs.VerdictMap.Put(key, verdict); err != nil {
+		return fmt.Errorf("write verdict map: %w", err)
+	}
+	l.log.Debug().
+		Uint64("inode", key.InodeNumber).
+		Uint32("device", key.DeviceId).
+		Msg("inode allowed in verdict map")
+	return nil
+}
+
+// ReadBaselineAllowCounter reads the per-CPU baseline_allow_counter and
+// returns the total number of kernel ALLOW fast-path hits (sum across all CPUs).
+// Phase 4 calls this periodically to expose the value as a Prometheus gauge.
+func (l *Loader) ReadBaselineAllowCounter() (uint64, error) {
+	var idx uint32
+	var values []uint64
+	if err := l.objs.BaselineAllowCounter.Lookup(idx, &values); err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read baseline allow counter: %w", err)
+	}
+	var total uint64
+	for _, v := range values {
+		total += v
+	}
+	return total, nil
+}
+
 // BlockPath resolves a file path to its inode key and writes a BLOCK
 // entry into the verdict map. This is the primary API for the AI feedback
 // loop to block a binary after analysis.

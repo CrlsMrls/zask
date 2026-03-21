@@ -151,3 +151,13 @@ func TestFindScriptInArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestAllowPath_MissingFile verifies that AllowPath propagates a stat error
+// when the target file does not exist (no BPF kernel map required).
+func TestAllowPath_MissingFile(t *testing.T) {
+	l := &Loader{} // no kernel objects loaded — tests only the path resolution step
+	err := l.AllowPath("/nonexistent/path/to/binary")
+	if err == nil {
+		t.Fatal("AllowPath() expected error for missing file, got nil")
+	}
+}

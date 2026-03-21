@@ -225,6 +225,17 @@ func (wp *WorkerPool) processEvent(ctx context.Context, ev zaskebpf.ZaskEvent, w
 
 	if action == ActionBlock {
 		wp.executeBlock(ev, result)
+	} else if wp.loader != nil {
+		// Promote the AI ALLOW verdict to the kernel map so subsequent
+		// executions of this binary bypass the ring buffer entirely.
+		key := ev.InodeKey()
+		if err := wp.loader.AllowInode(key); err != nil {
+			wp.log.Warn().
+				Err(err).
+				Uint64("inode", key.InodeNumber).
+				Str("argv", ev.GetArgv()).
+				Msg("failed to promote AI ALLOW to verdict map")
+		}
 	}
 
 	// Invoke callback for audit logging.
