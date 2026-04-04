@@ -1,6 +1,23 @@
 # Core Features & Capabilities
 
-Why ZASK? The following section lists the design principles & capabilities:
+This document lists the core features of ZASK:
+
+- [Core Features \& Capabilities](#core-features--capabilities)
+  - [Enforcement](#enforcement)
+    - [Kernel-level Enforcement](#kernel-level-enforcement)
+    - [Enforcement Switch](#enforcement-switch)
+    - [Daemon Self-Protection](#daemon-self-protection)
+  - [Detection \& Rules](#detection--rules)
+    - [Expressive Rule Engine](#expressive-rule-engine)
+    - [Sigma based rules \[planned\]](#sigma-based-rules-planned)
+    - [Tamper-Resistant Binary Identity via IMA](#tamper-resistant-binary-identity-via-ima)
+  - [AI](#ai)
+    - [AI-Powered Triage](#ai-powered-triage)
+    - [AI Resilience \& Fail-Safe Defaults](#ai-resilience--fail-safe-defaults)
+  - [Observability \& Operations](#observability--operations)
+    - [Multi-Format Audit Logging](#multi-format-audit-logging)
+    - [Cloud-native](#cloud-native)
+
 
 ## Enforcement
 
