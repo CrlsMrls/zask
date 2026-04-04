@@ -159,7 +159,7 @@ Configures the Tier 2 static rule engine.
 |--------|--------|-----------------------|-------------------------------------------|
 | `path` | string | `/etc/zask/rules.yaml`| Path to the rules YAML file               |
 
-The rules file is watched for changes using `fsnotify`. Modifying the file or sending `SIGHUP` to the daemon triggers a hot-reload without restart. When rules are reloaded, the Tier 1 inode cache is automatically cleared so that previously-cached "known-good" inodes are re-evaluated against the new rule set.
+The rules file is watched for changes using `fsnotify`. Modifying the file or sending `SIGHUP` to the daemon triggers a hot-reload without restart. When rules are reloaded, the Tier 1 content cache is automatically cleared so that previously-cached verdicts are re-evaluated against the new rule set.
 
 ### `spec.ai`
 
@@ -257,8 +257,8 @@ Rules use [CEL (Common Expression Language)](https://github.com/google/cel-go) c
 
 | Action  | Behavior                                                                                      |
 |---------|-----------------------------------------------------------------------------------------------|
-| `BLOCK` | Terminate the process (`SIGKILL`) and write its inode to the verdict map for eBPF-level blocking on subsequent runs. |
-| `ALLOW` | Explicitly whitelist the binary. The inode is added to the Tier 1 cache immediately and the event **skips Tier 3 AI analysis**. Use this to reduce noise from trusted system binaries. |
+| `BLOCK` | Terminate the process (`SIGKILL`) and write its SHA-256 content hash to the verdict map for eBPF-level blocking on subsequent runs (any path, same content). |
+| `ALLOW` | Explicitly whitelist the binary by content hash. The hash is added to the Tier 1 cache immediately and the event **skips Tier 3 AI analysis**. Use this to reduce noise from trusted system binaries. |
 | `ALERT` | Log a warning at the configured severity but allow the execution to proceed.                  |
 
 ### Rule Ordering (First Match Wins)
@@ -311,7 +311,7 @@ CEL (Common Expression Language) rules evaluate against structured event attribu
 | `ppid`        | int    | Parent process ID                                       |
 | `uid`         | int    | User ID                                                 |
 | `cgroup_id`   | int    | cgroup ID (useful for host vs. container distinction)   |
-| `inode`       | int    | Binary inode number                                     |
+| `inode`       | int    | Binary inode number (informational)                     |
 
 **Example CEL rules:**
 

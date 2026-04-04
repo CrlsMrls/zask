@@ -142,7 +142,19 @@ enum bpf_map_type
   BPF_MAP_TYPE_ARRAY = 2,
   BPF_MAP_TYPE_PERCPU_ARRAY = 6,
   BPF_MAP_TYPE_PERF_EVENT_ARRAY = 4,
+  BPF_MAP_TYPE_LRU_HASH = 9,
   BPF_MAP_TYPE_RINGBUF = 27,
+};
+
+/*
+ * BPF map update flags — passed as the flags argument to bpf_map_update_elem().
+ */
+enum
+{
+  BPF_ANY = 0,     /* create or update */
+  BPF_NOEXIST = 1, /* create only */
+  BPF_EXIST = 2,   /* update only */
+  BPF_F_LOCK = 4,  /* spin_lock-based atomics */
 };
 
 /*

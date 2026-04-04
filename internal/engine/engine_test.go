@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,6 +29,11 @@ func makeEventWithArgv(argv string) zaskebpf.ZaskEvent {
 	for i := 0; i < len(argv) && i < len(ev.Argv); i++ {
 		ev.Argv[i] = int8(argv[i])
 	}
+	// Use a deterministic hash derived from argv so that tests exercising the
+	// Tier 1 cache work correctly: same argv → same hash → same cache entry.
+	ev.HashAvailable = 1
+	h := sha256.Sum256([]byte(argv))
+	copy(ev.Hash[:], h[:])
 	return ev
 }
 
@@ -40,10 +46,12 @@ func makeEventWithScriptArgv(argv, script string) zaskebpf.ZaskEvent {
 	return ev
 }
 
-func TestInodeCache_HitAndMiss(t *testing.T) {
-	cache := NewInodeCache(100, 5*time.Minute)
+func TestContentCache_HitAndMiss(t *testing.T) {
+	cache := NewContentCache(100, 5*time.Minute)
 
-	key := zaskebpf.ZaskInodeKey{InodeNumber: 123, DeviceId: 1}
+	var key zaskebpf.ZaskExecKey
+	key.ChildHash[0] = 0x12
+	key.ChildHash[31] = 0x34
 
 	if cache.Contains(key) {
 		t.Error("Contains() = true for empty cache, want false")
@@ -55,10 +63,11 @@ func TestInodeCache_HitAndMiss(t *testing.T) {
 	}
 }
 
-func TestInodeCache_Expiration(t *testing.T) {
-	cache := NewInodeCache(100, 10*time.Millisecond)
+func TestContentCache_Expiration(t *testing.T) {
+	cache := NewContentCache(100, 10*time.Millisecond)
 
-	key := zaskebpf.ZaskInodeKey{InodeNumber: 456, DeviceId: 2}
+	var key zaskebpf.ZaskExecKey
+	key.ChildHash[0] = 0xAB
 	cache.Add(key)
 
 	if !cache.Contains(key) {
@@ -72,11 +81,13 @@ func TestInodeCache_Expiration(t *testing.T) {
 	}
 }
 
-func TestInodeCache_InodeKeyedNotPID(t *testing.T) {
-	cache := NewInodeCache(100, 5*time.Minute)
+func TestContentCache_KeyedByHash(t *testing.T) {
+	cache := NewContentCache(100, 5*time.Minute)
 
-	key1 := zaskebpf.ZaskInodeKey{InodeNumber: 100, DeviceId: 1}
-	key2 := zaskebpf.ZaskInodeKey{InodeNumber: 200, DeviceId: 1}
+	var key1 zaskebpf.ZaskExecKey
+	key1.ChildHash[0] = 0x01
+	var key2 zaskebpf.ZaskExecKey
+	key2.ChildHash[0] = 0x02
 
 	cache.Add(key1)
 
@@ -84,16 +95,17 @@ func TestInodeCache_InodeKeyedNotPID(t *testing.T) {
 		t.Error("Contains(key1) = false, want true")
 	}
 	if cache.Contains(key2) {
-		t.Error("Contains(key2) = true, want false (different inode)")
+		t.Error("Contains(key2) = true, want false (different hash)")
 	}
 }
 
-func TestInodeCache_EvictionAtCapacity(t *testing.T) {
-	cache := NewInodeCache(2, 5*time.Minute)
+func TestContentCache_EvictionAtCapacity(t *testing.T) {
+	cache := NewContentCache(2, 5*time.Minute)
 
-	k1 := zaskebpf.ZaskInodeKey{InodeNumber: 1, DeviceId: 1}
-	k2 := zaskebpf.ZaskInodeKey{InodeNumber: 2, DeviceId: 1}
-	k3 := zaskebpf.ZaskInodeKey{InodeNumber: 3, DeviceId: 1}
+	var k1, k2, k3 zaskebpf.ZaskExecKey
+	k1.ChildHash[0] = 1
+	k2.ChildHash[0] = 2
+	k3.ChildHash[0] = 3
 
 	cache.Add(k1)
 	cache.Add(k2)
@@ -481,12 +493,14 @@ func TestEngine_RateLimiterDropsExcess(t *testing.T) {
 // Bug fix: Cache invalidation on rule reload
 // =========================================================================
 
-func TestInodeCache_Clear(t *testing.T) {
-	cache := NewInodeCache(100, 5*time.Minute)
+func TestContentCache_Clear(t *testing.T) {
+	cache := NewContentCache(100, 5*time.Minute)
 
 	// Populate the cache.
-	for i := uint64(0); i < 10; i++ {
-		cache.Add(zaskebpf.ZaskInodeKey{InodeNumber: i, DeviceId: 1})
+	for i := range 10 {
+		var k zaskebpf.ZaskExecKey
+		k.ChildHash[0] = byte(i)
+		cache.Add(k)
 	}
 	if cache.Size() != 10 {
 		t.Fatalf("Size() = %d, want 10", cache.Size())
@@ -499,29 +513,33 @@ func TestInodeCache_Clear(t *testing.T) {
 	}
 
 	// Previously-cached keys must miss.
-	for i := uint64(0); i < 10; i++ {
-		if cache.Contains(zaskebpf.ZaskInodeKey{InodeNumber: i, DeviceId: 1}) {
-			t.Errorf("Contains(inode=%d) = true after Clear(), want false", i)
+	for i := range 10 {
+		var k zaskebpf.ZaskExecKey
+		k.ChildHash[0] = byte(i)
+		if cache.Contains(k) {
+			t.Errorf("Contains(child_hash[0]=%d) = true after Clear(), want false", i)
 		}
 	}
 }
 
-func TestInodeCache_ClearThenReuse(t *testing.T) {
-	cache := NewInodeCache(100, 5*time.Minute)
+func TestContentCache_ClearThenReuse(t *testing.T) {
+	cache := NewContentCache(100, 5*time.Minute)
 
-	k := zaskebpf.ZaskInodeKey{InodeNumber: 42, DeviceId: 1}
+	var k, k2 zaskebpf.ZaskExecKey
+	k.ChildHash[0] = 0x42
+	k2.ChildHash[0] = 0x63
+
 	cache.Add(k)
 	cache.Clear()
 
 	// After clearing, we should be able to add and find new entries.
-	k2 := zaskebpf.ZaskInodeKey{InodeNumber: 99, DeviceId: 1}
 	cache.Add(k2)
 
 	if !cache.Contains(k2) {
-		t.Error("Contains(99) = false after re-add, want true")
+		t.Error("Contains(k2) = false after re-add, want true")
 	}
 	if cache.Contains(k) {
-		t.Error("Contains(42) = true after Clear() + different add, want false")
+		t.Error("Contains(k) = true after Clear() + different add, want false")
 	}
 }
 
@@ -552,26 +570,35 @@ rules:
 // Phase 3b: Kernel fast-path promotion tests
 // =========================================================================
 
-// mockLoader records calls to AllowInode and BlockInode for unit testing.
+// mockLoader records calls to AllowExec and BlockExec for unit testing.
 type mockLoader struct {
-	allowed []zaskebpf.ZaskInodeKey
-	blocked []zaskebpf.ZaskInodeKey
+	allowed []zaskebpf.ZaskExecKey
+	blocked []zaskebpf.ZaskExecKey
 }
 
-func (m *mockLoader) AllowInode(key zaskebpf.ZaskInodeKey) error {
+func (m *mockLoader) AllowExec(key zaskebpf.ZaskExecKey) error {
 	m.allowed = append(m.allowed, key)
 	return nil
 }
 
-func (m *mockLoader) BlockInode(key zaskebpf.ZaskInodeKey) error {
+func (m *mockLoader) BlockExec(key zaskebpf.ZaskExecKey) error {
 	m.blocked = append(m.blocked, key)
 	return nil
 }
 
-// TestEngine_AllowInode_OnNullRuleMatch verifies that when an event matches
-// no rule (cache miss, Tier 2 pass-through), the engine calls AllowInode on
-// the loader to promote the inode to the kernel fast-path (T3b.3).
-func TestEngine_AllowInode_OnNullRuleMatch(t *testing.T) {
+// makeEventWithHash creates a ZaskEvent with HashAvailable=1 and the given
+// hash byte set at position 0. Used to test hash-based verdict map writes.
+func makeEventWithHash(hashByte byte) zaskebpf.ZaskEvent {
+	var ev zaskebpf.ZaskEvent
+	ev.HashAvailable = 1
+	ev.Hash[0] = hashByte
+	return ev
+}
+
+// TestEngine_AllowHash_OnNullRuleMatch verifies that when an event matches
+// no rule (cache miss, Tier 2 pass-through), the engine calls AllowExec on
+// the loader to promote the exec chain to the kernel fast-path (T3c.5).
+func TestEngine_AllowHash_OnNullRuleMatch(t *testing.T) {
 	log := zerolog.Nop()
 	ml := &mockLoader{}
 
@@ -585,7 +612,8 @@ func TestEngine_AllowInode_OnNullRuleMatch(t *testing.T) {
 	defer eng.Close()
 	eng.loader = ml
 
-	ev := zaskebpf.ZaskEvent{InodeNumber: 42, DeviceId: 7, Pid: 100}
+	ev := makeEventWithHash(0x42)
+	ev.Pid = 100
 	for i := 0; i < len("/usr/bin/ls"); i++ {
 		ev.Argv[i] = int8("/usr/bin/ls"[i])
 	}
@@ -593,20 +621,21 @@ func TestEngine_AllowInode_OnNullRuleMatch(t *testing.T) {
 	eng.Process(context.Background(), ev)
 
 	if len(ml.allowed) == 0 {
-		t.Fatal("AllowInode was NOT called for a no-rule-match event")
+		t.Fatal("AllowExec was NOT called for a no-rule-match event")
 	}
-	want := zaskebpf.ZaskInodeKey{InodeNumber: 42, DeviceId: 7}
+	var want zaskebpf.ZaskExecKey
+	want.ChildHash[0] = 0x42
 	if ml.allowed[0] != want {
-		t.Errorf("AllowInode called with key %+v, want %+v", ml.allowed[0], want)
+		t.Errorf("AllowExec called with child_hash %x, want %x", ml.allowed[0].ChildHash, want.ChildHash)
 	}
 	if len(ml.blocked) != 0 {
-		t.Errorf("BlockInode called %d times, want 0", len(ml.blocked))
+		t.Errorf("BlockExec called %d times, want 0", len(ml.blocked))
 	}
 }
 
-// TestEngine_AllowInode_OnAllowRuleMatch verifies that an explicit ALLOW rule
-// triggers AllowInode to promote the binary to the kernel fast-path (T3b.4).
-func TestEngine_AllowInode_OnAllowRuleMatch(t *testing.T) {
+// TestEngine_AllowHash_OnAllowRuleMatch verifies that an explicit ALLOW rule
+// triggers AllowExec to promote the exec chain to the kernel fast-path (T3c.5).
+func TestEngine_AllowHash_OnAllowRuleMatch(t *testing.T) {
 	log := zerolog.Nop()
 	ml := &mockLoader{}
 
@@ -631,7 +660,8 @@ rules:
 		t.Fatalf("LoadFromBytes() error = %v", err)
 	}
 
-	ev := zaskebpf.ZaskEvent{InodeNumber: 99, DeviceId: 3, Pid: 200}
+	ev := makeEventWithHash(0x99)
+	ev.Pid = 200
 	for i := 0; i < len("/usr/bin/ls"); i++ {
 		ev.Argv[i] = int8("/usr/bin/ls"[i])
 	}
@@ -642,20 +672,21 @@ rules:
 		t.Errorf("Action = %v, want ActionAllow", verdict.Action)
 	}
 	if len(ml.allowed) == 0 {
-		t.Fatal("AllowInode was NOT called for an ALLOW rule match")
+		t.Fatal("AllowExec was NOT called for an ALLOW rule match")
 	}
-	want := zaskebpf.ZaskInodeKey{InodeNumber: 99, DeviceId: 3}
+	var want zaskebpf.ZaskExecKey
+	want.ChildHash[0] = 0x99
 	if ml.allowed[0] != want {
-		t.Errorf("AllowInode called with key %+v, want %+v", ml.allowed[0], want)
+		t.Errorf("AllowExec called with child_hash %x, want %x", ml.allowed[0].ChildHash, want.ChildHash)
 	}
 	if len(ml.blocked) != 0 {
-		t.Errorf("BlockInode called %d times on ALLOW rule, want 0", len(ml.blocked))
+		t.Errorf("BlockExec called %d times on ALLOW rule, want 0", len(ml.blocked))
 	}
 }
 
-// TestEngine_NoAllowInode_OnBlockRuleMatch verifies that a BLOCK rule triggers
-// only BlockInode, never AllowInode (T3b.5).
-func TestEngine_NoAllowInode_OnBlockRuleMatch(t *testing.T) {
+// TestEngine_NoAllowHash_OnBlockRuleMatch verifies that a BLOCK rule triggers
+// only BlockExec, never AllowExec (T3c.10).
+func TestEngine_NoAllowHash_OnBlockRuleMatch(t *testing.T) {
 	log := zerolog.Nop()
 	ml := &mockLoader{}
 
@@ -681,7 +712,8 @@ rules:
 		t.Fatalf("LoadFromBytes() error = %v", err)
 	}
 
-	ev := zaskebpf.ZaskEvent{InodeNumber: 55, DeviceId: 2, Pid: 99999}
+	ev := makeEventWithHash(0x55)
+	ev.Pid = 99999
 	for i := 0; i < len("/usr/bin/nc"); i++ {
 		ev.Argv[i] = int8("/usr/bin/nc"[i])
 	}
@@ -692,14 +724,15 @@ rules:
 		t.Errorf("Action = %v, want ActionBlock", verdict.Action)
 	}
 	if len(ml.allowed) != 0 {
-		t.Errorf("AllowInode called %d times on BLOCK rule, want 0", len(ml.allowed))
+		t.Errorf("AllowExec called %d times on BLOCK rule, want 0", len(ml.allowed))
 	}
 	if len(ml.blocked) == 0 {
-		t.Fatal("BlockInode was NOT called for a BLOCK rule match")
+		t.Fatal("BlockExec was NOT called for a BLOCK rule match")
 	}
-	want := zaskebpf.ZaskInodeKey{InodeNumber: 55, DeviceId: 2}
+	var want zaskebpf.ZaskExecKey
+	want.ChildHash[0] = 0x55
 	if ml.blocked[0] != want {
-		t.Errorf("BlockInode called with key %+v, want %+v", ml.blocked[0], want)
+		t.Errorf("BlockExec called with child_hash %x, want %x", ml.blocked[0].ChildHash, want.ChildHash)
 	}
 }
 
@@ -756,6 +789,10 @@ func TestEngine_CacheClearedOnRuleReload(t *testing.T) {
 	for i := 0; i < len("/usr/bin/suspicious") && i < len(ev.Argv); i++ {
 		ev.Argv[i] = int8("/usr/bin/suspicious"[i])
 	}
+	// Set a stable hash so the cache can store and retrieve this event.
+	ev.HashAvailable = 1
+	knownHash := sha256.Sum256([]byte("/usr/bin/suspicious"))
+	copy(ev.Hash[:], knownHash[:])
 	v1 := eng.Process(ctx, ev)
 	if v1.Tier != 3 {
 		t.Fatalf("first pass: Tier = %d, want 3 (AI queue / no rule match)", v1.Tier)
@@ -916,6 +953,109 @@ rules:
 	}
 }
 
+// TestEngine_HashUnavailable_RulesEvaluate_NoLoaderCall verifies T3c.6:
+// when HashAvailable==0 (IMA not configured), rules are still evaluated but
+// no AllowExec or BlockExec call is made on the loader (no valid key to write).
+func TestEngine_HashUnavailable_RulesEvaluate_NoLoaderCall(t *testing.T) {
+	log := zerolog.Nop()
+	ml := &mockLoader{}
+
+	eng, err := New(EngineOptions{
+		RateLimit: 10,
+		RateBurst: 100,
+		Mode:      ModeLockdown,
+	}, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer eng.Close()
+	eng.loader = ml
+
+	blockRule := `
+rules:
+  - name: block-nc
+    condition: 'argv.contains("nc")'
+    action: BLOCK
+    severity: critical
+`
+	if err := eng.rules.LoadFromBytes([]byte(blockRule)); err != nil {
+		t.Fatalf("LoadFromBytes() error = %v", err)
+	}
+
+	// Event with HashAvailable=0 (IMA not configured).
+	var ev zaskebpf.ZaskEvent
+	ev.Pid = 1234
+	for i, b := range []byte("/usr/bin/nc") {
+		ev.Argv[i] = int8(b)
+	}
+	// HashAvailable is 0 by default (zero value).
+
+	verdict := eng.Process(context.Background(), ev)
+
+	// Rule should still match.
+	if verdict.Action != ActionBlock {
+		t.Errorf("Action = %v, want ActionBlock (rules still evaluate without hash)", verdict.Action)
+	}
+	if verdict.Tier != 2 {
+		t.Errorf("Tier = %d, want 2", verdict.Tier)
+	}
+	// No loader calls — we have no valid hash key.
+	if len(ml.blocked) != 0 {
+		t.Errorf("BlockExec called %d times with no hash, want 0", len(ml.blocked))
+	}
+	if len(ml.allowed) != 0 {
+		t.Errorf("AllowExec called %d times with no hash, want 0", len(ml.allowed))
+	}
+}
+
+// TestEngine_ScriptIdentityUsesInterpreterHash verifies that for interpreter
+// events the exec-chain key uses the interpreter's hash (child_hash), NOT the
+// script file's hash. Script content analysis is handled by Tier 2 CEL rules
+// via the script_path field (§ADR-exec-chain).
+func TestEngine_ScriptIdentityUsesInterpreterHash(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "test.py")
+	content := []byte("print('hello world')")
+	if err := os.WriteFile(scriptPath, content, 0o644); err != nil {
+		t.Fatalf("create script file: %v", err)
+	}
+
+	log := zerolog.Nop()
+	ml := &mockLoader{}
+	eng, err := New(EngineOptions{RateLimit: 10, RateBurst: 100}, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer eng.Close()
+	eng.loader = ml
+
+	// python3 event: interpreter hash byte 0xAB, script path in ScriptArgv.
+	// PID 99999 is non-existent — FindScriptPath returns "", falls back to ScriptArgv.
+	ev := makeEventWithHash(0xAB)
+	ev.Pid = 99999
+	for i, b := range []byte("/usr/bin/python3") {
+		ev.Argv[i] = int8(b)
+	}
+	for i, b := range []byte(scriptPath) {
+		ev.ScriptArgv[i] = int8(b)
+	}
+
+	eng.Process(context.Background(), ev)
+
+	if len(ml.allowed) == 0 {
+		t.Fatal("AllowExec was not called for interpreter event")
+	}
+
+	// The exec-chain key must use the interpreter's hash (0xAB), not the script hash.
+	var want zaskebpf.ZaskExecKey
+	want.ChildHash[0] = 0xAB // interpreter hash — set by makeEventWithHash
+	// want.ParentHash is all-zeros (unknown parent sentinel)
+	if ml.allowed[0].ChildHash[0] != want.ChildHash[0] {
+		t.Errorf("AllowExec child_hash[0] = %x, want interpreter hash %x (not script hash)",
+			ml.allowed[0].ChildHash[0], want.ChildHash[0])
+	}
+}
+
 // TestEngine_BlockBeforeAllowOrdering verifies the recommended production
 // pattern: specific BLOCK rules before a broad ALLOW catchall. This is the
 // rule ordering documented in configuration.md — a specific BLOCK for a
@@ -1063,13 +1203,14 @@ func TestEngine_InterpreterFlagIgnored(t *testing.T) {
 }
 
 func TestEngine_InterpreterCacheByScriptInode(t *testing.T) {
-	// Two different scripts run by the same interpreter should NOT share
-	// cache entries. The cache key should be the script's inode, not the
-	// interpreter's.  This tests the scenario where /proc is unavailable,
-	// so ResolvePathToInode fails and we fall back to the interpreter's
-	// inode — but the script_argv still differs and should be evaluated
-	// independently by the rule engine on each invocation (at least the
-	// first time).
+	// With the compound exec-chain key, two different scripts run by the same
+	// interpreter under the same parent will share the same cache key:
+	// (parent_hash, interpreter_hash).
+	//
+	// Script-level differentiation is a Tier 2 CEL concern (script_path field).
+	// This test documents that the Tier 1 cache correctly uses the exec-chain
+	// key, which means the second call will hit the cache from the first when
+	// the interpreter and parent are the same (intended behavior §ADR-exec-chain).
 	log := zerolog.Nop()
 	aiQueue := make(chan zaskebpf.ZaskEvent, 100)
 
@@ -1101,13 +1242,11 @@ func TestEngine_InterpreterCacheByScriptInode(t *testing.T) {
 		t.Fatal("safe script was unexpectedly blocked")
 	}
 
-	// Script 2: /tmp/evil.py — SHOULD be blocked, must NOT hit cache
-	// from script 1.
-	//
-	// NOTE: since ResolvePathToInode fails for both (non-existent paths),
-	// the cache key falls back to the interpreter inode in both cases.
-	// This means the second invocation WILL hit the cache if the interpreter
-	// inode is the same. This is a known limitation when /proc is unavailable
+	// Script 2: /tmp/evil.py — rule matches, but the Tier 1 cache may have
+	// already been populated by script 1 (same exec-chain key). This is the
+	// intended behavior: both scripts map to
+	// (parent_hash=zeros, child_hash=interpreter_hash), so the cache is shared.
+	// Script content inspection must be done in Tier 2 rules (script_path field).
 	// AND the script path can't be stat'd.
 	//
 	// In production, the process is alive (sleeping), so FindScriptPath
@@ -1124,7 +1263,7 @@ func TestEngine_InterpreterCacheByScriptInode(t *testing.T) {
 	// likely fail (file doesn't exist in test), so the key stays as the
 	// interpreter inode → cache hit → ALLOW. This documents the known
 	// limitation.
-	t.Logf("Script 2 verdict: Action=%v, Tier=%d (documents fallback behavior)", v2.Action, v2.Tier)
+	t.Logf("Script 2 verdict: Action=%v, Tier=%d (exec-chain cache shared by design)", v2.Action, v2.Tier)
 }
 
 func TestEngine_VerdictIncludesScriptPath(t *testing.T) {
@@ -1212,5 +1351,52 @@ func TestEngine_SetScriptArgvCleansOldValue(t *testing.T) {
 	got := ev.GetScriptArgv()
 	if got != "/x.py" {
 		t.Errorf("after overwrite: GetScriptArgv() = %q, want %q", got, "/x.py")
+	}
+}
+
+// TestEngine_ParentHashUnavailableSentinel verifies (§ADR-exec-chain) that
+// when ParentHashAvailable == 0 (parent started before ZASK or is PID 1),
+// the engine still writes an AllowExec verdict with an all-zeros parent hash
+// (unknown-parent sentinel), enabling the kernel fast-path for such processes.
+func TestEngine_ParentHashUnavailableSentinel(t *testing.T) {
+	log := zerolog.Nop()
+	ml := &mockLoader{}
+
+	eng, err := New(EngineOptions{
+		RateLimit: 10,
+		RateBurst: 100,
+	}, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer eng.Close()
+	eng.loader = ml
+
+	// HashAvailable=1 (IMA hash present) but ParentHashAvailable=0 (parent
+	// started before ZASK — unknown parent sentinel).
+	ev := makeEventWithHash(0x77)
+	ev.ParentHashAvailable = 0 // default, but explicit for clarity
+	ev.Pid = 100
+	for i, b := range []byte("/usr/bin/ls") {
+		ev.Argv[i] = int8(b)
+	}
+
+	eng.Process(context.Background(), ev)
+
+	if len(ml.allowed) == 0 {
+		t.Fatal("AllowExec was NOT called for unknown-parent event")
+	}
+
+	key := ml.allowed[0]
+
+	// ParentHash must be all-zeros (unknown-parent sentinel).
+	var zeroHash [32]uint8
+	if key.ParentHash != zeroHash {
+		t.Errorf("ParentHash = %x, want all-zeros (unknown-parent sentinel)", key.ParentHash)
+	}
+
+	// ChildHash must be the interpreter hash from makeEventWithHash.
+	if key.ChildHash[0] != 0x77 {
+		t.Errorf("ChildHash[0] = %x, want 0x77", key.ChildHash[0])
 	}
 }

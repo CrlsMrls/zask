@@ -34,6 +34,7 @@ type AuditEvent struct {
 	Mode       string    `json:"mode"       parquet:"mode"`
 	Reasoning  string    `json:"reasoning,omitempty"  parquet:"reasoning,optional"`
 	AIModel    string    `json:"ai_model,omitempty"   parquet:"ai_model,optional"`
+	Hash       string    `json:"hash,omitempty"       parquet:"hash,optional"` // hex-encoded SHA-256 (empty if IMA unavailable)
 	Inode      uint64    `json:"inode"      parquet:"inode"`
 	CgroupID   uint64    `json:"cgroup_id"  parquet:"cgroup_id"`
 	AIRisk     float64   `json:"ai_risk,omitempty"    parquet:"ai_risk,optional"`

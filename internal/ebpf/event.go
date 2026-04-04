@@ -47,7 +47,32 @@ func nullTerminatedInt8ToString(data []int8) string {
 	return string(buf)
 }
 
-// InodeKey extracts the inode key from the event for map lookups.
+// HashKey returns the child binary's content hash.
+// Useful for single-binary identity (script hashing, ComputeFileHash results).
+// For verdict map operations, use ExecKey() which includes the parent hash.
+// Returns the zero key if HashAvailable == 0 (IMA not configured).
+func (e *ZaskEvent) HashKey() ZaskHashKey {
+	var k ZaskHashKey
+	copy(k.Hash[:], e.Hash[:])
+	return k
+}
+
+// ExecKey returns the compound exec-chain identity key for verdict map lookups.
+// Key is (parent_hash, child_hash): encodes WHO invokes WHAT.
+//
+// When ParentHashAvailable == 0, parent_hash is all-zeros (unknown-parent
+// sentinel). This correctly mismatches any verdict stored with a real parent
+// hash, so unknown-parent events fall through to userspace on first encounter.
+func (e *ZaskEvent) ExecKey() ZaskExecKey {
+	var k ZaskExecKey
+	copy(k.ParentHash[:], e.ParentHash[:])
+	copy(k.ChildHash[:], e.Hash[:])
+	return k
+}
+
+// InodeKey returns the inode-based key for informational/debugging purposes.
+// NOTE: InodeKey is no longer used as the verdict map identity (§3c.3.5).
+// It is retained for debug logging only. Use HashKey() for enforcement.
 func (e *ZaskEvent) InodeKey() ZaskInodeKey {
 	return ZaskInodeKey{
 		InodeNumber: e.InodeNumber,

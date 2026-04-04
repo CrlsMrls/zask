@@ -96,14 +96,14 @@ type Verdict struct {
 // Kept unexported; the concrete *ebpf.Loader satisfies this automatically.
 // Tests inject a mock implementation.
 type loaderFace interface {
-	BlockInode(key zaskebpf.ZaskInodeKey) error
-	AllowInode(key zaskebpf.ZaskInodeKey) error
+	BlockExec(key zaskebpf.ZaskExecKey) error
+	AllowExec(key zaskebpf.ZaskExecKey) error
 }
 
 // Engine is the multi-tiered policy engine.
 type Engine struct {
 	log          zerolog.Logger
-	cache        *InodeCache
+	cache        *ContentCache
 	rules        *RuleEngine
 	limiter      *rate.Limiter
 	loader       loaderFace
@@ -168,7 +168,7 @@ func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 	if cacheSize == 0 {
 		cacheSize = 10000
 	}
-	cache := NewInodeCache(cacheSize, cacheTTL)
+	cache := NewContentCache(cacheSize, cacheTTL)
 
 	// Tier 2: Static rules
 	rules := NewRuleEngine(engineLog)
@@ -179,9 +179,9 @@ func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 	}
 
 	// Wire cache invalidation: when rules are reloaded, all cached
-	// "known-good" inodes must be re-evaluated against the new rule set.
+	// "known-good" hashes must be re-evaluated against the new rule set.
 	rules.onReload = func() {
-		engineLog.Info().Msg("rules reloaded, clearing inode cache")
+		engineLog.Info().Msg("rules reloaded, clearing content cache")
 		cache.Clear()
 	}
 
@@ -225,7 +225,6 @@ func New(opts EngineOptions, log zerolog.Logger) (*Engine, error) {
 // Process evaluates an event through the decision cascade.
 // It returns the verdict and executes any enforcement actions (SIGKILL, map update).
 func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
-	key := ev.InodeKey()
 	argv := ev.GetArgv()
 	scriptArgv := ev.GetScriptArgv()
 
@@ -235,16 +234,38 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 	// hold stale pre-exec data from the eBPF layer).
 	var resolvedScript string
 
-	// Script/Interpreter Awareness (§2b.2): if the binary is a known
-	// interpreter, resolve the script's identity for caching/blocking.
+	// hashUnavailable is set when IMA did not provide a hash (e.g., IMA not
+	// configured). In this case rules still run, but we skip kernel map writes.
+	hashUnavailable := ev.HashAvailable == 0
+
+	if hashUnavailable {
+		e.log.Warn().
+			Uint32("pid", ev.Pid).
+			Str("argv", argv).
+			Msg("IMA hash unavailable, skipping kernel fast-path")
+	}
+
+	// key is the compound exec-chain identity: (parent_hash, child_hash).
+	// It encodes WHO invokes WHAT, enabling context-aware verdicts
+	// (e.g., nginx→bash BLOCK, sshd→bash ALLOW).
 	//
-	// We prefer /proc/[pid]/cmdline over the eBPF-captured script_argv
-	// because the eBPF hook fires during bprm_check_security, before the
-	// exec replaces the process's memory map. At that point task->mm
-	// still holds the parent's (forking shell's) argv layout, so the
-	// captured argv[1] is from the wrong process. /proc/[pid]/cmdline
-	// is read after exec completes and reflects the actual interpreter
-	// invocation.
+	// When ParentHashAvailable == 0, the parent hash is all-zeros (unknown-parent
+	// sentinel). The verdict map key technically works, but we log at Debug so
+	// operators know the first-seen verdict is based on incomplete chain context.
+	key := ev.ExecKey()
+	if ev.ParentHashAvailable == 0 && !hashUnavailable {
+		e.log.Debug().
+			Uint32("pid", ev.Pid).
+			Str("argv", argv).
+			Msg("parent hash unavailable, using zero sentinel in exec-chain key")
+	}
+
+	// Script/Interpreter Awareness (§2b.2, §3c.4.5): if the binary is a known
+	// interpreter, resolve the script path for CEL rule evaluation. Unlike
+	// Phase 3c, the script hash is NOT used as the verdict cache key —
+	// the compound (parent, interpreter) exec-chain key is the correct
+	// kernel-tier granularity. Script content analysis belongs in Tier 2
+	// (CEL `script_path` field).
 	binaryName := filepath.Base(argv)
 	if e.interpreters[binaryName] {
 		// Prefer procfs — the authoritative source once exec completes.
@@ -265,22 +286,15 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 			if scriptPath != scriptArgv {
 				e.setScriptArgv(&ev, scriptPath)
 			}
-			scriptKey, err := zaskebpf.ResolvePathToInode(scriptPath)
-			if err != nil {
-				e.log.Debug().
-					Err(err).
-					Str("script", scriptPath).
-					Msg("failed to resolve script inode, falling back to interpreter inode")
-			} else {
-				key = scriptKey
-			}
 		}
 	}
 
-	// Tier 1: Cache lookup (fast-path ignore for known-good inodes).
-	if e.cache.Contains(key) {
+	// Tier 1: Cache lookup (fast-path for known-good exec chains).
+	// Skip when hashUnavailable: the zero key would cause unrelated events to
+	// collide in the cache, producing incorrect verdicts.
+	if !hashUnavailable && e.cache.Contains(key) {
 		e.log.Debug().
-			Uint64("inode", key.InodeNumber).
+			Str("child_hash", fmt.Sprintf("%.8x", key.ChildHash)).
 			Msg("tier 1 cache hit — skipping")
 		return Verdict{Action: ActionAllow, Tier: 1, ScriptPath: resolvedScript}
 	}
@@ -293,13 +307,17 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 			action = ActionBlock
 			e.enforce(ev, key)
 		case actionAllowLabel:
-			// Explicit ALLOW: cache the inode as known-good, promote to
+			// Explicit ALLOW: cache the hash as known-good, promote to
 			// the kernel map for fast-path handling, and skip Tier 3.
 			action = ActionAllow
-			e.cache.Add(key)
-			if e.loader != nil {
-				if err := e.loader.AllowInode(key); err != nil {
-					e.log.Warn().Err(err).Uint64("inode", key.InodeNumber).Msg("failed to promote ALLOW rule to verdict map")
+			if !hashUnavailable {
+				e.cache.Add(key)
+			}
+			if e.loader != nil && !hashUnavailable {
+				if err := e.loader.AllowExec(key); err != nil {
+					e.log.Warn().Err(err).
+						Str("child_hash", fmt.Sprintf("%.8x", key.ChildHash)).
+						Msg("failed to promote ALLOW rule to verdict map")
 				}
 			}
 		}
@@ -317,10 +335,14 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 
 	// No rule match — add to Tier 1 cache as known-good, promote to the
 	// kernel map for fast-path handling, then route to Tier 3.
-	e.cache.Add(key)
-	if e.loader != nil {
-		if err := e.loader.AllowInode(key); err != nil {
-			e.log.Warn().Err(err).Uint64("inode", key.InodeNumber).Msg("failed to promote unknown binary to verdict map")
+	if !hashUnavailable {
+		e.cache.Add(key)
+	}
+	if e.loader != nil && !hashUnavailable {
+		if err := e.loader.AllowExec(key); err != nil {
+			e.log.Warn().Err(err).
+				Str("child_hash", fmt.Sprintf("%.8x", key.ChildHash)).
+				Msg("failed to promote unknown binary to verdict map")
 		}
 	}
 
@@ -347,11 +369,11 @@ func (e *Engine) Process(ctx context.Context, ev zaskebpf.ZaskEvent) Verdict {
 
 // enforce sends SIGKILL to the offending process and writes a BLOCK
 // entry into the verdict map. In Monitor mode, it only logs.
-func (e *Engine) enforce(ev zaskebpf.ZaskEvent, key zaskebpf.ZaskInodeKey) {
+func (e *Engine) enforce(ev zaskebpf.ZaskEvent, key zaskebpf.ZaskExecKey) {
 	if e.mode == ModeMonitor {
 		e.log.Warn().
 			Uint32("pid", ev.Pid).
-			Uint64("inode", key.InodeNumber).
+			Str("child_hash", fmt.Sprintf("%.8x", key.ChildHash)).
 			Str("argv", ev.GetArgv()).
 			Msg("monitor mode: would have blocked (no enforcement)")
 		return
@@ -364,9 +386,9 @@ func (e *Engine) enforce(ev zaskebpf.ZaskEvent, key zaskebpf.ZaskInodeKey) {
 		e.log.Info().Uint32("pid", ev.Pid).Msg("process killed")
 	}
 
-	// Write BLOCK verdict to the kernel map.
-	if e.loader != nil {
-		if err := e.loader.BlockInode(key); err != nil {
+	// Write BLOCK verdict to the kernel map only if IMA hash is available.
+	if e.loader != nil && ev.HashAvailable != 0 {
+		if err := e.loader.BlockExec(key); err != nil {
 			e.log.Error().Err(err).Msg("failed to update verdict map")
 		}
 	}
@@ -391,30 +413,31 @@ func (e *Engine) setScriptArgv(ev *zaskebpf.ZaskEvent, path string) {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 1: Inode-based LRU Cache
+// Tier 1: Content-Hash-Based LRU Cache
 // ---------------------------------------------------------------------------
 
-// InodeCache is a thread-safe, time-expiring cache keyed by inode.
-// It uses a simple map with periodic eviction rather than a full LRU
-// to keep the implementation straightforward (KISS).
-type InodeCache struct {
-	entries map[zaskebpf.ZaskInodeKey]time.Time
+// ContentCache is a thread-safe, time-expiring cache keyed by exec-chain key.
+// It caches known-good exec-chain decisions so the engine skips Tier 2/3 for
+// previously-evaluated (parent, child) binary pairs. Content-addressed:
+// the same binary pair shares a single cache entry regardless of path or inode.
+type ContentCache struct {
+	entries map[zaskebpf.ZaskExecKey]time.Time
 	mu      sync.RWMutex
 	ttl     time.Duration
 	maxSize int
 }
 
-// NewInodeCache creates a new inode cache with the given capacity and TTL.
-func NewInodeCache(maxSize int, ttl time.Duration) *InodeCache {
-	return &InodeCache{
-		entries: make(map[zaskebpf.ZaskInodeKey]time.Time, maxSize),
+// NewContentCache creates a new exec-chain cache with the given capacity and TTL.
+func NewContentCache(maxSize int, ttl time.Duration) *ContentCache {
+	return &ContentCache{
+		entries: make(map[zaskebpf.ZaskExecKey]time.Time, maxSize),
 		maxSize: maxSize,
 		ttl:     ttl,
 	}
 }
 
-// Contains checks if the inode key is in the cache and not expired.
-func (c *InodeCache) Contains(key zaskebpf.ZaskInodeKey) bool {
+// Contains checks if the exec-chain key is in the cache and not expired.
+func (c *ContentCache) Contains(key zaskebpf.ZaskExecKey) bool {
 	c.mu.RLock()
 	expiry, ok := c.entries[key]
 	c.mu.RUnlock()
@@ -431,10 +454,10 @@ func (c *InodeCache) Contains(key zaskebpf.ZaskInodeKey) bool {
 	return true
 }
 
-// Add inserts an inode key into the cache. If the cache is full,
+// Add inserts an exec-chain key into the cache. If the cache is full,
 // expired entries are evicted first; if still full, the oldest entry
 // is removed.
-func (c *InodeCache) Add(key zaskebpf.ZaskInodeKey) {
+func (c *ContentCache) Add(key zaskebpf.ZaskExecKey) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -450,7 +473,7 @@ func (c *InodeCache) Add(key zaskebpf.ZaskInodeKey) {
 
 	// If still at capacity, evict the oldest entry.
 	if len(c.entries) >= c.maxSize {
-		var oldestKey zaskebpf.ZaskInodeKey
+		var oldestKey zaskebpf.ZaskExecKey
 		var oldestTime time.Time
 		first := true
 		for k, exp := range c.entries {
@@ -467,19 +490,19 @@ func (c *InodeCache) Add(key zaskebpf.ZaskInodeKey) {
 }
 
 // Size returns the current number of entries in the cache.
-func (c *InodeCache) Size() int {
+func (c *ContentCache) Size() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.entries)
 }
 
 // Clear removes all entries from the cache. This is used when rules are
-// reloaded so that previously-cached "known-good" inodes are re-evaluated
+// reloaded so that previously-cached "known-good" hashes are re-evaluated
 // against the new rule set.
-func (c *InodeCache) Clear() {
+func (c *ContentCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries = make(map[zaskebpf.ZaskInodeKey]time.Time, c.maxSize)
+	c.entries = make(map[zaskebpf.ZaskExecKey]time.Time, c.maxSize)
 }
 
 // ---------------------------------------------------------------------------

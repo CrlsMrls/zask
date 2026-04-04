@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -152,12 +153,90 @@ func TestFindScriptInArgs(t *testing.T) {
 	}
 }
 
-// TestAllowPath_MissingFile verifies that AllowPath propagates a stat error
-// when the target file does not exist (no BPF kernel map required).
-func TestAllowPath_MissingFile(t *testing.T) {
-	l := &Loader{} // no kernel objects loaded — tests only the path resolution step
-	err := l.AllowPath("/nonexistent/path/to/binary")
+// --- T3c.3: ComputeFileHash ---
+
+// TestComputeFileHash_KnownContent verifies that ComputeFileHash returns the
+// SHA-256 of the file's content (T3c.3).
+func TestComputeFileHash_KnownContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "testbin")
+	content := []byte("hello zask")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+
+	key, err := ComputeFileHash(path)
+	if err != nil {
+		t.Fatalf("ComputeFileHash() error = %v", err)
+	}
+
+	want := sha256.Sum256(content)
+	var wantKey ZaskHashKey
+	copy(wantKey.Hash[:], want[:])
+
+	if key != wantKey {
+		t.Errorf("ComputeFileHash() = %x, want %x", key.Hash, wantKey.Hash)
+	}
+}
+
+// TestComputeFileHash_SameContentSameKey confirms that two files with
+// identical content produce the same hash key (content-addressed identity).
+func TestComputeFileHash_SameContentSameKey(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("#!/bin/sh\necho hi\n")
+
+	a := filepath.Join(dir, "a.sh")
+	b := filepath.Join(dir, "b.sh")
+	for _, p := range []string{a, b} {
+		if err := os.WriteFile(p, content, 0o755); err != nil {
+			t.Fatalf("create %s: %v", p, err)
+		}
+	}
+
+	keyA, err := ComputeFileHash(a)
+	if err != nil {
+		t.Fatalf("ComputeFileHash(a) error = %v", err)
+	}
+	keyB, err := ComputeFileHash(b)
+	if err != nil {
+		t.Fatalf("ComputeFileHash(b) error = %v", err)
+	}
+	if keyA != keyB {
+		t.Errorf("identical content produced different hashes: a=%x b=%x", keyA.Hash, keyB.Hash)
+	}
+}
+
+// TestComputeFileHash_DifferentContentDifferentKey confirms that two files
+// with different content produce different hash keys.
+func TestComputeFileHash_DifferentContentDifferentKey(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	if err := os.WriteFile(a, []byte("original"), 0o644); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if err := os.WriteFile(b, []byte("tampered"), 0o644); err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+
+	keyA, err := ComputeFileHash(a)
+	if err != nil {
+		t.Fatalf("ComputeFileHash(a) error = %v", err)
+	}
+	keyB, err := ComputeFileHash(b)
+	if err != nil {
+		t.Fatalf("ComputeFileHash(b) error = %v", err)
+	}
+	if keyA == keyB {
+		t.Error("different content produced the same hash — tamper detection would fail")
+	}
+}
+
+// TestComputeFileHash_MissingFile confirms that ComputeFileHash returns an
+// error for a file that does not exist.
+func TestComputeFileHash_MissingFile(t *testing.T) {
+	_, err := ComputeFileHash("/nonexistent/path/to/file")
 	if err == nil {
-		t.Fatal("AllowPath() expected error for missing file, got nil")
+		t.Fatal("ComputeFileHash() expected error for missing file, got nil")
 	}
 }

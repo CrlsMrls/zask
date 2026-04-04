@@ -42,7 +42,7 @@ type EventContext struct {
 	Username    string // resolved from UID
 	CgroupPath  string // resolved from /proc/[pid]/cgroup
 	CgroupID    uint64 // raw cgroup ID (used internally, not sent to LLM)
-	InodeNumber uint64 // raw inode (used internally for verdict map, not sent to LLM)
+	InodeNumber uint64 // raw inode (informational only — not used as identity in Phase 3c+)
 	PID         uint32 // used internally for process kill, not sent to LLM
 	PPID        uint32
 	UID         uint32

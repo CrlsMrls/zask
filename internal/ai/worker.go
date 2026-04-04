@@ -227,14 +227,16 @@ func (wp *WorkerPool) processEvent(ctx context.Context, ev zaskebpf.ZaskEvent, w
 		wp.executeBlock(ev, result)
 	} else if wp.loader != nil {
 		// Promote the AI ALLOW verdict to the kernel map so subsequent
-		// executions of this binary bypass the ring buffer entirely.
-		key := ev.InodeKey()
-		if err := wp.loader.AllowInode(key); err != nil {
-			wp.log.Warn().
-				Err(err).
-				Uint64("inode", key.InodeNumber).
-				Str("argv", ev.GetArgv()).
-				Msg("failed to promote AI ALLOW to verdict map")
+		// executions of this exec chain bypass the ring buffer entirely.
+		// Only promote if IMA provided a hash for this event.
+		if ev.HashAvailable != 0 {
+			key := ev.ExecKey()
+			if err := wp.loader.AllowExec(key); err != nil {
+				wp.log.Warn().
+					Err(err).
+					Str("argv", ev.GetArgv()).
+					Msg("failed to promote AI ALLOW to verdict map")
+			}
 		}
 	}
 
@@ -245,9 +247,8 @@ func (wp *WorkerPool) processEvent(ctx context.Context, ev zaskebpf.ZaskEvent, w
 }
 
 // executeBlock performs the full BLOCK feedback loop:
-//  1. Resolve the binary path to an inode key.
-//  2. Write a BLOCK entry to the verdict map.
-//  3. Send SIGKILL to the offending process.
+//  1. Write a BLOCK entry to the verdict map (if IMA hash available).
+//  2. Send SIGKILL to the offending process.
 //
 // In monitor mode, the verdict is logged but not enforced (no map write,
 // no SIGKILL). The verdict callback is still invoked for audit logging.
@@ -263,20 +264,19 @@ func (wp *WorkerPool) executeBlock(ev zaskebpf.ZaskEvent, result AnalysisResult)
 		return
 	}
 
-	// Write to verdict map using the event's inode key.
-	// The binary path is already resolved to an inode in the event.
-	key := ev.InodeKey()
-	if wp.loader != nil {
-		if err := wp.loader.BlockInode(key); err != nil {
+	// Write to verdict map using the event's exec-chain key.
+	// Only write if IMA provided a hash for this event.
+	if wp.loader != nil && ev.HashAvailable != 0 {
+		key := ev.ExecKey()
+		if err := wp.loader.BlockExec(key); err != nil {
 			wp.log.Error().
 				Err(err).
 				Str("argv", argv).
-				Uint64("inode", key.InodeNumber).
 				Msg("failed to update verdict map from AI verdict")
 		} else {
 			wp.log.Info().
-				Uint64("inode", key.InodeNumber).
-				Uint32("device", key.DeviceId).
+				Str("parent_hash", fmt.Sprintf("%x", key.ParentHash)).
+				Str("child_hash", fmt.Sprintf("%x", key.ChildHash)).
 				Str("argv", argv).
 				Msg("verdict map updated: BLOCK")
 		}

@@ -5,15 +5,21 @@
 // eBPF LSM programs for kernel-native binary execution control.
 //
 // Programs:
-//   zask_bprm_check  — LSM gatekeeper on bprm_check_security (Tier 1).
+//   zask_bprm_check   — LSM gatekeeper on bprm_check_security (Tier 1).
 //   zask_task_kill    — Self-protection hook preventing unauthorized
 //                       signals to the ZASK daemon.
+//   zask_process_exit — Tracepoint to evict dead PIDs from pid_hash_map.
 //
 // Maps:
-//   verdict_map     — Hash map: inode_key → verdict (ALLOW/BLOCK).
+//   verdict_map     — Hash map: exec_key → verdict (ALLOW/BLOCK).
+//   pid_hash_map    — LRU hash: pid → hash[32] (exec-chain identity).
 //   events          — Ring buffer exporting telemetry to user-space.
 //   protected_pids  — Hash map of PIDs shielded from SIGKILL/SIGTERM.
 //   drop_counter    — Per-CPU counter tracking ring buffer overflows.
+//
+// Kernel prerequisites (Phase 3c/ADR):
+//   - Kernel ≥ 5.18 for bpf_ima_file_hash() support.
+//   - CONFIG_IMA=y with measurement policy covering exec (ima_policy=tcb).
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -32,6 +38,9 @@ char LICENSE[] SEC("license") = "GPL";
 // source string exceeds ARGV_MAX - 1 bytes.
 #define ARGV_MAX 256
 
+// SHA-256 produces a 32-byte digest used as content-derived binary identity.
+#define HASH_SIZE 32
+
 // Verdict constants for verdict_map values.
 #define VERDICT_ALLOW 0
 #define VERDICT_BLOCK 1
@@ -44,12 +53,24 @@ char LICENSE[] SEC("license") = "GPL";
 // Structs
 // ---------------------------------------------------------------------------
 
-// inode_key uniquely identifies a file across filesystems.
-// Used as the key for verdict_map lookups.
-struct inode_key
+// exec_key is the verdict map key — a content-derived exec-chain pair.
+// Identity: (parent_binary_hash, child_binary_hash) → verdict.
+//
+// This is intentionally content-addressed: the same binary pair executes
+// identically regardless of path, inode, or mount namespace. IMA tamper
+// detection is free: bpf_ima_file_hash() re-computes when i_version changes.
+//
+// Example enforcement:
+//   (hash(nginx), hash(bash)) → BLOCK  (web server must not spawn a shell)
+//   (hash(sshd),  hash(bash)) → ALLOW  (SSH daemon may open an interactive shell)
+//
+// When the parent hash is unavailable (process started before ZASK, or PID 1),
+// parent_hash is all-zeros (sentinel). The sentinel key correctly mismatches
+// any verdict stored with a known parent hash, forcing userspace evaluation.
+struct exec_key
 {
-  __u64 inode_number;
-  __u32 device_id;
+  __u8 parent_hash[HASH_SIZE]; // SHA-256 of the parent binary (zero = unknown)
+  __u8 child_hash[HASH_SIZE];  // SHA-256 of the child binary (exec target)
 };
 
 // event is the telemetry record exported to user-space via the ring buffer.
@@ -58,40 +79,66 @@ struct inode_key
 // -type flag of the go:generate directive ensures alignment.
 //
 // Field order is chosen to minimise padding: u64 fields first, then u32,
-// then u8 and the trailing char array.
+// then u8 fields grouped together, then the trailing char arrays.
 struct event
 {
-  __u64 inode_number;
+  __u64 inode_number; // informational — not used as identity
   __u64 cgroup_id;
   __u32 pid;
   __u32 ppid;
   __u32 uid;
-  __u32 device_id;
-  __u8 is_map_hit;            // 1 if verdict_map contained an entry
-  char argv[ARGV_MAX];        // executable filename (truncated to ARGV_MAX)
-  char script_argv[ARGV_MAX]; // raw argv[1] — may be a flag; Go engine resolves via procfs
+  __u32 device_id;             // informational
+  __u8 is_map_hit;             // 1 if verdict_map contained an entry
+  __u8 hash_available;         // 1 if IMA hash was obtained for child, 0 if not
+  __u8 hash[HASH_SIZE];        // SHA-256 of child binary (zero if unavailable)
+  __u8 parent_hash_available;  // 1 if parent hash resolved from pid_hash_map
+  __u8 parent_hash[HASH_SIZE]; // SHA-256 of parent binary (zero if unavailable)
+  char argv[ARGV_MAX];         // executable filename (truncated to ARGV_MAX)
+  char script_argv[ARGV_MAX];  // raw argv[1] — may be a flag; Go engine resolves via procfs
 };
 
 // ---------------------------------------------------------------------------
 // Maps
 // ---------------------------------------------------------------------------
 
-// verdict_map stores per-inode enforcement decisions (§1.3).
+// verdict_map stores exec-chain enforcement decisions (§ADR-exec-chain).
 //
-// Key:   inode_key {inode_number, device_id}
+// Key:   exec_key {parent_hash[32], child_hash[32]} — compound content identity
 // Value: __u32 — VERDICT_ALLOW (0) or VERDICT_BLOCK (1)
 //
-// Capacity: 10 000 entries. Each entry is ~20 bytes (16-byte key + 4-byte
-// value), so full occupancy uses ~200 KB of kernel memory. Increase
-// max_entries for environments monitoring more than 10 000 unique binaries,
-// but note that hash-map lookup remains O(1) regardless of size.
+// The compound key encodes WHO invokes WHAT, enabling context-aware enforcement:
+// the same child binary can be ALLOWed when invoked by sshd but BLOCKed by nginx.
+// Content-addressing means: copies of a binary share one verdict entry regardless
+// of path, inode, or container. IMA tamper detection is free: overwriting a binary
+// changes its hash, invalidating the prior verdict automatically.
+//
+// Capacity: 10 000 entries. Each entry is ~68 bytes (64-byte key + 4-byte value).
 struct
 {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 10000);
-  __type(key, struct inode_key);
+  __type(key, struct exec_key);
   __type(value, __u32);
 } verdict_map SEC(".maps");
+
+// pid_hash_map tracks the SHA-256 hash of the last exec'd binary for each PID.
+// Used to construct the compound exec_key: when a new exec occurs, the parent's
+// hash is looked up here so that (parent_hash, child_hash) → verdict lookups work.
+//
+// Key:   __u32 pid — host PID namespace (LSM hooks always see host PIDs)
+// Value: __u8 hash[HASH_SIZE] — SHA-256 from bpf_ima_file_hash() at execve time
+//
+// LRU eviction handles capacity overflow. The sched_process_exit tracepoint
+// provides explicit cleanup to prevent stale entries from PID reuse.
+//
+// Capacity: 65536 — covers typical Linux systems (default PID max is ~32768).
+struct
+{
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536);
+  __type(key, __u32);
+  __type(value, __u8[HASH_SIZE]);
+} pid_hash_map SEC(".maps");
 
 // events is the ring buffer for exporting telemetry to user-space (§1.4).
 //
@@ -155,81 +202,140 @@ struct
 // Programs
 // ---------------------------------------------------------------------------
 
-// zask_bprm_check is the Tier 1 LSM gatekeeper (§1.1, §1.3).
+// zask_bprm_check is the Tier 1 LSM gatekeeper (§1.1, §1.3, §3c.2.3, §ADR).
 //
 // Intercepts every execve-family syscall via the bprm_check_security hook.
 // Decision flow:
-//   1. Extract inode_key from the binary being loaded.
-//   2. Look up verdict_map for a pre-existing verdict.
-//   3. Emit a telemetry event to the ring buffer (regardless of verdict).
-//   4. Return -EPERM for BLOCK, 0 for ALLOW or unknown binaries.
+//   1. Read inode metadata (informational — for logging only).
+//   2. Call bpf_ima_file_hash() to get the child binary's SHA-256 hash.
+//      If IMA is unavailable, hash_available=0 and the event falls through
+//      to userspace without a kernel fast-path verdict.
+//   3. Look up the parent process's hash from pid_hash_map (exec-chain identity).
+//   4. Store the child hash in pid_hash_map for future children of this PID.
+//   5. If hash available, look up verdict_map[(parent_hash, child_hash)].
+//   6. Emit a telemetry event to the ring buffer (for BLOCK hits and unknowns).
+//   7. Return -EPERM for BLOCK, 0 for ALLOW or unknown binaries.
 //
 // Default policy is fail-open (ALLOW) to avoid breaking normal operations.
 // The Go control plane and AI layer populate verdict_map entries over time.
-SEC("lsm/bprm_check_security")
+SEC("lsm.s/bprm_check_security")
 int BPF_PROG(zask_bprm_check, struct linux_binprm *bprm)
 {
-  // --- 1. Identity extraction (§1.2) ---
+  // --- 1. Identity extraction — inode metadata for logging (§1.2) ---
 
-  // Walk bprm->file->f_inode to get the binary's inode and device.
-  // Each BPF_CORE_READ emits a BTF relocation so offsets are resolved
-  // at load time, making this portable across kernel versions.
-  struct file *f = BPF_CORE_READ(bprm, file);
+  // Use direct field access (not BPF_CORE_READ) for the file pointer.
+  // BPF_CORE_READ routes through bpf_probe_read_kernel which writes raw bytes
+  // to a stack buffer; loading from that buffer gives the verifier a scalar,
+  // losing the ptr_to_btf_id type required by bpf_ima_file_hash().
+  // Direct access generates a typed ldx instruction that preserves the type.
+  struct file *f = bprm->file;
   struct inode *inode = BPF_CORE_READ(f, f_inode);
 
-  struct inode_key key = {};
-  key.inode_number = BPF_CORE_READ(inode, i_ino);
-
-  // s_dev encodes the major/minor device number of the filesystem.
+  __u64 inode_number = BPF_CORE_READ(inode, i_ino);
   struct super_block *sb = BPF_CORE_READ(inode, i_sb);
-  key.device_id = BPF_CORE_READ(sb, s_dev);
+  __u32 device_id = BPF_CORE_READ(sb, s_dev);
 
-  // --- 2. Verdict map lookup (§1.3.2) ---
+  // --- 2. Process context — PID/PPID needed for exec-chain key ---
+  //
+  // Extract these before the ring buffer reservation so they are available
+  // for pid_hash_map operations and event population.
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 cur_pid = (__u32)(pid_tgid >> 32);
+
+  struct task_struct *task =
+      (struct task_struct *)bpf_get_current_task();
+  struct task_struct *par = BPF_CORE_READ(task, real_parent);
+  __u32 par_pid = BPF_CORE_READ(par, tgid);
+
+  // --- 3. Child hash via IMA (§3c.2.3) ---
+  //
+  // bpf_ima_file_hash() reads the IMA-computed SHA-256 hash from the
+  // inode security blob. IMA hashes executed files lazily on first exec
+  // (with ima_policy=tcb) and caches the result; subsequent execs of the
+  // same unmodified file get a cached lookup at O(1) cost.
+  //
+  // If IMA is not configured or hasn't measured this file yet,
+  // bpf_ima_file_hash() returns a negative errno. In that case we set
+  // hash_available=0 and proceed without a map lookup — the event still
+  // reaches userspace so rules and AI can evaluate behavioral signals.
+
+  struct exec_key key = {};
+  __u8 hash_available = 0;
+  __u8 parent_hash_available = 0;
+
+  int ima_ret = bpf_ima_file_hash(f, key.child_hash, HASH_SIZE);
+  if (ima_ret >= 0)
+    hash_available = 1;
+
+  // --- 4. Exec-chain key: look up parent hash from pid_hash_map (§ADR) ---
+  //
+  // The pid_hash_map stores each process's content hash at exec time.
+  // Look up the parent's hash BEFORE updating our own entry so we see
+  // the parent's value, not a stale entry from a PID-reuse scenario.
+  //
+  // If the parent has no entry (started before ZASK, or PID 1), the
+  // parent_hash field stays all-zeros — the "unknown parent" sentinel.
+  // Store our own hash for future children of this process.
+  if (hash_available)
+  {
+    __u8 *phash = bpf_map_lookup_elem(&pid_hash_map, &par_pid);
+    if (phash)
+    {
+      __builtin_memcpy(key.parent_hash, phash, HASH_SIZE);
+      parent_hash_available = 1;
+    }
+    // Store child hash keyed by our PID for future children.
+    bpf_map_update_elem(&pid_hash_map, &cur_pid, key.child_hash, BPF_ANY);
+  }
+
+  // --- 5. Verdict map lookup (§1.3.2) ---
+  //
+  // Look up the compound (parent_hash, child_hash) key. When parent_hash
+  // is all-zeros (unknown-parent sentinel), this correctly mismatches any
+  // verdict stored with a real parent hash, so unknown-parent events always
+  // fall through to userspace on first encounter.
 
   int verdict = VERDICT_ALLOW;
   __u8 is_map_hit = 0;
 
-  __u32 *value = bpf_map_lookup_elem(&verdict_map, &key);
-  if (value)
+  if (hash_available)
   {
-    is_map_hit = 1;
-    verdict = *value;
-    if (verdict == VERDICT_ALLOW)
+    __u32 *value = bpf_map_lookup_elem(&verdict_map, &key);
+    if (value)
     {
-      // Fast-path: known-good binary. Skip the ring buffer entirely —
-      // no userspace involvement needed. Increment the per-CPU counter
-      // so Phase 4 can expose this volume as a Prometheus metric.
-      __u32 idx = 0;
-      __u64 *cnt = bpf_map_lookup_elem(&baseline_allow_counter, &idx);
-      if (cnt)
-        __sync_fetch_and_add(cnt, 1);
-      return 0;
+      is_map_hit = 1;
+      verdict = *value;
+      if (verdict == VERDICT_ALLOW)
+      {
+        // Fast-path: known-good exec chain. Skip the ring buffer entirely —
+        // no userspace involvement needed. Increment the per-CPU counter
+        // so Phase 4 can expose this volume as a Prometheus metric.
+        __u32 idx = 0;
+        __u64 *cnt = bpf_map_lookup_elem(&baseline_allow_counter, &idx);
+        if (cnt)
+          __sync_fetch_and_add(cnt, 1);
+        return 0;
+      }
     }
   }
 
-  // --- 3. Telemetry export (§1.4) ---
+  // --- 6. Telemetry export (§1.4) ---
   // Reached only for BLOCK hits (is_map_hit=1, verdict=BLOCK) and
   // unknown binaries (is_map_hit=0). ALLOW fast-path exits above.
 
   // Reserve space directly in the ring buffer to avoid stack allocation
-  // of the ~300-byte event struct (BPF stack limit is 512 bytes).
+  // of the large event struct (BPF stack limit is 512 bytes).
   struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e)
   {
     // Process metadata (§1.2.4).
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    e->pid = (__u32)(pid_tgid >> 32);
+    e->pid = cur_pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
+    e->ppid = par_pid;
 
-    // PPID: walk current task_struct → real_parent → tgid.
-    struct task_struct *task =
-        (struct task_struct *)bpf_get_current_task();
-    struct task_struct *parent = BPF_CORE_READ(task, real_parent);
-    e->ppid = BPF_CORE_READ(parent, tgid);
-
-    // Inode metadata.
-    e->inode_number = key.inode_number;
-    e->device_id = key.device_id;
+    // Inode metadata (informational — not used as identity).
+    e->inode_number = inode_number;
+    e->device_id = device_id;
 
     // Cgroup ID for container-aware policy differentiation
     // (§1.5.4). Allows the Go orchestrator to distinguish
@@ -238,6 +344,12 @@ int BPF_PROG(zask_bprm_check, struct linux_binprm *bprm)
 
     // Source flag (§1.4.4).
     e->is_map_hit = is_map_hit;
+
+    // Exec-chain hash fields (§ADR-exec-chain).
+    e->hash_available = hash_available;
+    __builtin_memcpy(e->hash, key.child_hash, HASH_SIZE);
+    e->parent_hash_available = parent_hash_available;
+    __builtin_memcpy(e->parent_hash, key.parent_hash, HASH_SIZE);
 
     // Argument extraction (§1.2.3, §2b.1).
     // Read the executable filename from linux_binprm.
@@ -302,11 +414,28 @@ int BPF_PROG(zask_bprm_check, struct linux_binprm *bprm)
       __sync_fetch_and_add(cnt, 1);
   }
 
-  // --- 4. Enforcement (§1.3.3) ---
+  // --- 7. Enforcement (§1.3.3) ---
 
   if (verdict == VERDICT_BLOCK)
     return -EPERM;
 
+  return 0;
+}
+
+// zask_process_exit evicts a PID's hash entry from pid_hash_map when the
+// process terminates (§ADR-exec-chain). Without explicit cleanup, dead PID
+// slots remain until LRU eviction — fine for correctness, but leaves stale
+// entries that could be inherited by a new process reusing the same PID.
+//
+// This tracepoint fires on every thread exit. We use the tgid (process PID)
+// as the key, matching what zask_bprm_check stores, so the entry is removed
+// when the thread group leader exits.
+SEC("tp/sched/sched_process_exit")
+int zask_process_exit(void *ctx)
+{
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 pid = (__u32)(pid_tgid >> 32);
+  bpf_map_delete_elem(&pid_hash_map, &pid);
   return 0;
 }
 

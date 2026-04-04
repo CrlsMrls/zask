@@ -1,6 +1,6 @@
 # Kernel Requirements
 
-ZASK requires a Linux kernel with eBPF LSM support. These are **hard prerequisites** — the daemon cannot start without them.
+ZASK requires a Linux kernel with eBPF LSM support and IMA (Integrity Measurement Architecture). These are **hard prerequisites** — the daemon cannot start without them.
 
 ---
 
@@ -8,22 +8,23 @@ ZASK requires a Linux kernel with eBPF LSM support. These are **hard prerequisit
 
 | Requirement | Value |
 |---|---|
-| Kernel version | **≥ 5.8** |
+| Kernel version | **≥ 5.18** |
 | `CONFIG_BPF_LSM` | `=y` |
 | `CONFIG_DEBUG_INFO_BTF` | `=y` |
 | `CONFIG_BPF_SYSCALL` | `=y` |
-| Boot parameter | `lsm=...,bpf,...` |
+| `CONFIG_IMA` | `=y` |
+| Boot parameters | `lsm=...,bpf,...` and `ima_policy=tcb` |
 | BPF filesystem | mounted at `/sys/fs/bpf` |
 | Runtime capabilities | `CAP_BPF`, `CAP_SYS_ADMIN`, `CAP_KILL` |
 
 ---
 
-## Kernel Version ≥ 5.8
+## Kernel Version ≥ 5.18
 
-5.8 is the first kernel version where both core eBPF primitives used by ZASK are stable simultaneously:
+5.18 is the minimum for two reasons:
 
-- **`BPF_MAP_TYPE_RINGBUF`** — the ring buffer map type ZASK uses to stream security events from the kernel eBPF program to the userspace daemon with minimal overhead. It was added in 5.8.
-- **eBPF LSM hooks** — hooks that allow eBPF programs to intercept Linux Security Module decisions (e.g. `bprm_check_security` for binary execution). They landed in 5.7 and stabilised in 5.8.
+- **`bpf_ima_file_hash()`** — introduced in kernel 5.18. ZASK calls this helper from its eBPF LSM hook to read the IMA-measured SHA-256 hash of each executed binary in O(1) time (the hash is already cached in the inode security blob by IMA). This is the foundation of ZASK's content-derived binary identity.
+- Earlier requirements still apply: **`BPF_MAP_TYPE_RINGBUF`** (5.8) and **eBPF LSM hooks** (stabilised in 5.8).
 
 Reference: [BPF ring buffer — kernel docs](https://www.kernel.org/doc/html/latest/bpf/ringbuf.html)
 
@@ -57,15 +58,44 @@ Reference: [bpf(2) — Linux man pages](https://man7.org/linux/man-pages/man2/bp
 
 ---
 
-## Boot Parameter `lsm=...,bpf,...`
+## `CONFIG_IMA=y`
+
+**IMA (Integrity Measurement Architecture)** is the kernel subsystem that measures file content and stores the hash in the inode security blob. ZASK reads these measurements via `bpf_ima_file_hash()` at the point of `execve()`.
+
+Without IMA:
+- `bpf_ima_file_hash()` returns `-ENOENT` for unmeasured files.
+- ZASK falls back gracefully: events are still processed, CEL rules still evaluate, but the kernel-side hash fast-path (`verdict_map` lookup) is bypassed.
+
+> **Note:** `CONFIG_IMA_APPRAISE` is **not** required. ZASK only reads hashes — it does not use IMA's appraisal (signature verification) feature.
+
+**Why content-derived identity matters:**
+
+1. **Tamper detection.** If an attacker overwrites a binary in-place, the inode number is unchanged but IMA detects the content change (new hash). The old ALLOW verdict does not apply.
+2. **Cross-container deduplication.** The same container image on N nodes has different inodes but identical content → one hash, one verdict evaluation.
+3. **Hash-based threat intel compatibility.** STIX/TAXII feeds, VirusTotal, and Sigma `Hashes` fields distribute known-bad SHA-256 hashes. ZASK can consume them directly.
+
+Reference: [IMA — kernel docs](https://www.kernel.org/doc/html/latest/security/IMA-templates.html)
+
+---
+
+## Boot Parameters
+
+### `lsm=...,bpf,...`
 
 The kernel only activates the LSMs explicitly listed in the `lsm=` boot parameter. `CONFIG_BPF_LSM=y` compiles the support in, but it is not enabled at runtime unless `bpf` appears in this list. Omitting it silently disables all eBPF LSM hooks even on a correctly compiled kernel.
 
-The exact set of other modules (e.g. `lockdown`, `capability`, `selinux`) depends on the distribution and security policy. ZASK only requires that `bpf` is present somewhere in the list.
+### `ima_policy=tcb`
 
-For how to set this parameter on your distribution, see [boot-parameter-setup.md](boot-parameter-setup.md).
+This boot parameter activates the built-in IMA Trusted Computing Base policy, which among other things enables measurement of all executed files (`func=BPRM_CHECK`). Without an active IMA measurement policy, `bpf_ima_file_hash()` may return `-ENOENT` for binaries IMA hasn't measured yet — ZASK handles this gracefully but loses the hash fast-path benefit.
 
-Reference: [kernel-parameters.txt — `lsm=`](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)
+Alternatively, a custom policy can be placed in `/etc/ima/ima-policy`:
+```
+measure func=BPRM_CHECK
+```
+
+For how to set boot parameters on your distribution, see [boot-parameter-setup.md](boot-parameter-setup.md).
+
+Reference: [kernel-parameters.txt — `lsm=`, `ima_policy=`](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)
 
 ---
 

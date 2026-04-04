@@ -1,7 +1,7 @@
 # Lima VM template for ZASK development
 #
-# Provides a Linux VM with kernel ≥ 5.8, LSM BPF enabled, and all
-# toolchain dependencies for eBPF development on macOS.
+# Provides a Linux VM with kernel ≥ 5.18, LSM BPF enabled, IMA enabled,
+# and all toolchain dependencies for eBPF development on macOS.
 #
 # Usage:
 #   limactl start lima/zask.yaml
@@ -93,6 +93,14 @@ provision:
         # Ensure selinux is preserved in the LSM list
         grubby --update-kernel=ALL --args="lsm=lockdown,capability,landlock,yama,selinux,bpf"
         echo "NOTE: BPF LSM boot parameter added. A VM restart is required."
+        echo "Run: limactl stop zask && limactl start zask"
+      fi
+
+      # Enable IMA with tcb policy to activate bprm_check measurement.
+      # bpf_ima_file_hash() requires an active IMA policy covering BPRM_CHECK.
+      if ! grubby --info=ALL | grep -q "ima_policy"; then
+        grubby --update-kernel=ALL --args="ima_policy=tcb"
+        echo "NOTE: ima_policy=tcb boot parameter added. A VM restart is required."
         echo "Run: limactl stop zask && limactl start zask"
       fi
 

