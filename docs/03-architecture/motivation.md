@@ -16,11 +16,13 @@ This document explains why ZASK exists. The projects below are much more mature 
 
 All four projects share one constraint: **policy is written by humans before the fact**. They are excellent at enforcing known rules. None of them can reason about a binary or behavior they have never been told about.
 
-ZASK asks one question: **can an LLM meaningfully reason about an unknown exec chain at runtime, and can that be made reliable enough to use as a fallback in a security enforcement engine?**
+ZASK asks one question: **can an LLM meaningfully reason about an unknown exec chain at runtime, and can that be made reliable enough to use as a fallback in a security enforcement engine?**. This is genuinely unknown.
 
-In the future, when **AI bots may be used by attackers** to generate novel exploits on the fly, this capability may be critical.
+In the future, when **AI bots will be used by attackers** to generate novel exploits on the fly, this capability may be critical.
 
-This is genuinely unknown. The approach has real risks and open questions:
+## Risks and open questions
+
+The AI approach has real risks and open questions:
 
 - **Latency & execution window** — LLM inference takes seconds. While the process is queued for AI analysis, it continues running — a [TOCTOU](https://en.wikipedia.org/wiki/Time_of_check_to_time_of_use) window an attacker could exploit. A fast ML tier (ONNX-based) is planned to shrink this window; subsequent attempts are blocked at the kernel level regardless.
 - **Reliability** — LLMs are probabilistic. A security control that gives different answers to identical inputs is hard to audit. Whether two AI tiers can reliably catch novel threats (e.g., base64-encoded payloads, anomalous parent-child chains like `curl` spawned by `nginx`) remains an open question.

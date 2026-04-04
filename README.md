@@ -19,9 +19,9 @@ Most security tools detect threats syntactically — matching signatures, hashes
 
 Another Linux security tool? 
 
-- Read [Why ZASK exists?](./docs/03-architecture/motivation.md) for the motivation behind this project and comparison with existing tools.
+- [Why ZASK exists?](./docs/03-architecture/motivation.md) — Compares ZASK against SELinux, AppArmor, Falco, and Tetragon, and explains the specific gap they all share: no existing tool can reason about unknown binaries or behaviors at runtime.
 
-- Read [design principles & capabilities](./docs/03-architecture/core-capabilities.md) for the main planned features.
+- [Core features](./docs/03-architecture/core-features.md) — Describes the core capabilities: kernel-level enforcement, the expressive rule engine, AI resilience patterns, and cloud-native operability.
 
 ## How It Works
 
