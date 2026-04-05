@@ -4,7 +4,7 @@ Autonomous Linux Kernel Hardening via eBPF LSM and AI.
 
 **ZASK (Zero-trust AI-Secured Kernel)** is an autonomous security engine that evaluates and blocks Linux processes using raw eBPF LSM telemetry, a deterministic engine, and a semantic AI-based judgement.
 
-Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. ZASK asks a different question: can Linux kernel-level security enforcement be made semantic? [This is that attempt](./docs/03-architecture/motivation.md).
+Most security tools detect threats syntactically — matching signatures, hashes, or known-bad patterns. Meanwhile, attackers are already using AI to generate novel exploits faster than humans can write rules. ZASK asks a different question: can Linux kernel-level security enforcement be made semantic? [ZASK is that attempt](./docs/03-architecture/motivation.md).
 
 > ⚠️ ZASK is still experimental, not yet a production-ready EDR. The Machine Learning tier is planned but not yet implemented. Impact on performance must be better analized. Feedback on the architecture, threat model, or approach is very welcome — open an issue or reach out directly.
 
@@ -15,11 +15,11 @@ Most security tools detect threats syntactically — matching signatures, hashes
 - **[Architecture & Design](./docs/03-architecture/README.md)**
 - **[Development](./docs/04-development/README.md)**
 
-## Core Capabilities
+## Background and Motivation
 
 Another Linux security tool? 
 
-- [Why ZASK exists?](./docs/03-architecture/motivation.md) — Compares ZASK against SELinux, AppArmor, Falco, and Tetragon, and explains the specific gap they all share: no existing tool can reason about unknown binaries or behaviors at runtime.
+- [Why ZASK exists?](./docs/03-architecture/motivation.md) — The specific threat ZASK is built for: AI-assisted offense outpacing static defenses. Also compares ZASK against SELinux, AppArmor, Falco, and Tetragon.
 
 - [Core features](./docs/03-architecture/core-features.md) — Describes the core capabilities: kernel-level enforcement, the expressive rule engine, AI resilience patterns, and cloud-native operability.
 

@@ -1,8 +1,16 @@
 # ZASK — Motivation
 
-This document explains why ZASK exists. The projects below are much more mature and widely deployed. ZASK is not trying to replace them — it is exploring a specific gap they all share: [integrating AI into the enforcement](../02-configuration/ai-integration.md).
+This document explains why ZASK exists. 
+
+## Why ZASK exists
+
+Attackers are already using AI to generate novel exploits, [obfuscated payloads](https://cloud.google.com/blog/topics/threat-intelligence/threat-actor-usage-of-ai-tools), and unusual execution patterns faster than any human can write rules to catch them. A static policy system can only block what its authors have already seen.
+
+ZASK is built on one premise: **the only practical response to AI-assisted offense is AI-assisted defense**. Will this be effective? That is the question this project explores.
 
 ## The projects ZASK learns from
+
+The production-ready projects below are much more mature and widely deployed. ZASK is not trying to replace them — it is exploring a specific gap they all share: [integrating AI into the enforcement](../02-configuration/ai-integration.md).
 
 **[SELinux](https://github.com/SELinuxProject/selinux)** assigns security labels to every process and file, then enforces a policy matrix over those labels. It is the gold standard for Linux confinement. Its weakness is operational cost — writing and maintaining correct policy requires deep expertise.
 
